@@ -1,0 +1,905 @@
+const vscode = require('vscode');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const USER_DIR = path.join(os.homedir(), 'AppData/Roaming/Code/User');
+const CUS_BASE_CSS = path.join(USER_DIR, 'cus-base.css');
+
+// 把本地图片转成 base64 data URI —— 绕过 workbench CSP 对 file:/// 的拦截(关键修复)
+function imageToDataUri(fileUrl) {
+    try {
+        // file:///C:/... → C:\...
+        let p = String(fileUrl).replace(/^file:\/\/\//, '').replace(/\//g, '\\');
+        p = decodeURIComponent(p);
+        if (!fs.existsSync(p)) return fileUrl; // 找不到就退回原路径
+        const ext = (path.extname(p).slice(1) || 'png').toLowerCase();
+        const mime = ext === 'jpg' ? 'jpeg' : ext;
+        const b64 = fs.readFileSync(p).toString('base64');
+        return `data:image/${mime};base64,${b64}`;
+    } catch (e) { return fileUrl; }
+}
+
+// 动画三档预设(与之前设计一致)
+const ANIM_PRESETS = {
+    default: {
+        '.monaco-list-row': 'transition: background-color 120ms cubic-bezier(0.25,0.1,0.25,1), border-radius 120ms cubic-bezier(0.25,0.1,0.25,1) !important;',
+        '.monaco-workbench .part.editor > .content .editor-group-container > .title div.tabs-container > .tab': 'transition: background-color 180ms ease, border-color 180ms ease, opacity 180ms ease !important;',
+        '.monaco-button, .monaco-workbench .activitybar .action-item, .monaco-action-bar .action-item': 'transition: background-color 120ms ease, color 120ms ease, transform 120ms ease !important;',
+        '.monaco-workbench .activitybar .action-item:hover .action-label': 'transform: translateY(-1px);',
+        '.monaco-inputbox': 'transition: border-color 180ms ease, box-shadow 180ms ease !important;',
+        '.quick-input-widget': 'animation: apc-fade-in 260ms cubic-bezier(0.25,0.1,0.25,1);',
+        '.suggest-widget': 'animation: apc-fade-scale 180ms ease;',
+        '.monaco-hover': 'animation: apc-fade-scale 120ms ease;',
+        '.monaco-workbench .notifications-toasts .notification-toast': 'animation: apc-fade-in 260ms ease;',
+        '.monaco-menu-container': 'animation: apc-fade-scale 120ms ease;',
+        '.monaco-workbench .part.sidebar .composite.viewlet': 'animation: apc-slide-in-left 180ms ease;'
+    },
+    smooth: {
+        '.monaco-list-row': 'transition: background-color 110ms cubic-bezier(0.25,0.1,0.25,1) !important;',
+        '.monaco-workbench .part.editor > .content .editor-group-container > .title div.tabs-container > .tab': 'transition: background-color 160ms ease, border-color 160ms ease, opacity 160ms ease !important;',
+        '.monaco-button, .monaco-workbench .activitybar .action-item, .monaco-action-bar .action-item': 'transition: background-color 110ms ease, color 110ms ease !important;',
+        '.monaco-inputbox': 'transition: border-color 160ms ease, box-shadow 160ms ease !important;'
+    },
+    // 弹跳:入场带回弹,活泼
+    bounce: {
+        '.monaco-list-row': 'transition: background-color 120ms ease, border-radius 120ms ease !important;',
+        '.monaco-workbench .part.editor > .content .editor-group-container > .title div.tabs-container > .tab': 'transition: background-color 180ms cubic-bezier(0.34,1.56,0.64,1), opacity 180ms ease !important;',
+        '.monaco-button, .monaco-workbench .activitybar .action-item, .monaco-action-bar .action-item': 'transition: transform 180ms cubic-bezier(0.34,1.56,0.64,1), background-color 120ms ease !important;',
+        '.monaco-workbench .activitybar .action-item:hover .action-label': 'transform: translateY(-2px) scale(1.08);',
+        '.quick-input-widget': 'animation: apc-bounce-in 320ms cubic-bezier(0.34,1.56,0.64,1);',
+        '.suggest-widget': 'animation: apc-bounce-in 260ms cubic-bezier(0.34,1.56,0.64,1);',
+        '.monaco-hover': 'animation: apc-zoom-in 140ms ease;',
+        '.monaco-workbench .notifications-toasts .notification-toast': 'animation: apc-bounce-in 340ms cubic-bezier(0.34,1.56,0.64,1);',
+        '.monaco-menu-container': 'animation: apc-bounce-in 220ms cubic-bezier(0.34,1.56,0.64,1);'
+    },
+    // 华丽:翻转/缩放/滑入综合,效果最丰富
+    fancy: {
+        '.monaco-list-row': 'transition: background-color 140ms ease, border-radius 140ms ease, transform 140ms ease !important;',
+        '.monaco-workbench .part.editor > .content .editor-group-container > .title div.tabs-container > .tab': 'transition: background-color 200ms ease, border-color 200ms ease, opacity 200ms ease, transform 200ms cubic-bezier(0.34,1.56,0.64,1) !important;',
+        '.monaco-button, .monaco-workbench .activitybar .action-item, .monaco-action-bar .action-item': 'transition: transform 160ms cubic-bezier(0.34,1.56,0.64,1), background-color 140ms ease, box-shadow 140ms ease !important;',
+        '.monaco-workbench .activitybar .action-item:hover .action-label': 'transform: translateY(-2px) scale(1.1);',
+        '.monaco-inputbox': 'transition: border-color 180ms ease, box-shadow 180ms ease !important;',
+        '.quick-input-widget': 'animation: apc-flip-in 300ms cubic-bezier(0.22,0.61,0.36,1);',
+        '.suggest-widget': 'animation: apc-zoom-in 200ms cubic-bezier(0.34,1.56,0.64,1);',
+        '.monaco-hover': 'animation: apc-zoom-in 150ms ease;',
+        '.monaco-workbench .notifications-toasts .notification-toast': 'animation: apc-flip-in 360ms cubic-bezier(0.22,0.61,0.36,1);',
+        '.monaco-menu-container': 'animation: apc-flip-in 240ms cubic-bezier(0.22,0.61,0.36,1);',
+        '.monaco-workbench .part.sidebar .composite.viewlet': 'animation: apc-slide-in-left 220ms cubic-bezier(0.34,1.56,0.64,1);'
+    },
+    off: {}
+};
+
+// 背景「仅代码区」CSS 生成 —— 图贴编辑器区,让编辑器各背景层透明露出图
+function codeOnlyCss(bgUrl, opacity) {
+    // 经真实 DOM 验证有效的选择器(红块测试通过)
+    // 图以 ::after 覆盖在编辑器区,pointer-events:none 不挡操作,opacity 控制浓淡
+    const op = (opacity == null ? 0.25 : opacity);
+    return {
+        ".editor-group-container > .editor-container > .editor-instance":
+            'position: relative !important;',
+        ".editor-group-container > .editor-container > .editor-instance::after":
+            `content:'' !important; position:absolute !important; top:0; left:0; width:100%; height:100%; z-index:10 !important; pointer-events:none !important; background-image: url("${bgUrl}"); background-position: center center; background-repeat: no-repeat; background-size: cover; opacity: ${op};`
+    };
+}
+const CODE_ONLY_KEYS = Object.keys(codeOnlyCss('x', 0.92));
+
+async function reloadCUS() {
+    try { await vscode.commands.executeCommand('custom-ui-style.reload'); }
+    catch (e) { vscode.window.showWarningMessage('已改配置,但自动 reload 失败,请手动运行 "Custom UI Style: Reload"。'); }
+}
+
+async function setConfig(updates) {
+    const cfg = vscode.workspace.getConfiguration();
+    for (const [key, val] of updates) {
+        await cfg.update(key, val, vscode.ConfigurationTarget.Global);
+    }
+}
+
+// 合并 stylesheet: 应用动画档 + 代码区背景(互不干扰)
+function buildStylesheet(current, animMode, bgMode, bgUrl) {
+    let base = {};
+    // 从 current 里剔除所有由本插件管理的键(动画各档 + 代码区),保留用户手加的
+    const managed = new Set([
+        ...Object.keys(ANIM_PRESETS.default),
+        ...Object.keys(ANIM_PRESETS.smooth),
+        ...CODE_ONLY_KEYS
+    ]);
+    for (const k of Object.keys(current || {})) {
+        if (!managed.has(k)) base[k] = current[k];
+    }
+    // 叠加动画档
+    Object.assign(base, ANIM_PRESETS[animMode] || {});
+    // 叠加代码区背景
+    if (bgMode === 'codeOnly' && bgUrl) {
+        const op = vscode.workspace.getConfiguration().get('custom-ui-style.background.opacity');
+        Object.assign(base, codeOnlyCss(bgUrl, op));
+    }
+    return base;
+}
+
+// 改 cus-base.css 里的圆角基准变量(只改 --r 那一行,可反复修改不损坏)
+function setRadius(px) {
+    try {
+        let css = fs.readFileSync(CUS_BASE_CSS, 'utf8');
+        if (/--r:\s*\d+px/.test(css)) {
+            css = css.replace(/--r:\s*\d+px/, `--r: ${px}px`);
+        } else {
+            // 兼容:文件没有变量则补一行
+            css = ':root { --r: ' + px + 'px; }\n' + css;
+        }
+        fs.writeFileSync(CUS_BASE_CSS, css);
+        return true;
+    } catch (e) { return false; }
+}
+// 读当前圆角值
+function getRadius() {
+    try {
+        const m = fs.readFileSync(CUS_BASE_CSS, 'utf8').match(/--r:\s*(\d+)px/);
+        return m ? parseInt(m[1], 10) : 8;
+    } catch (e) { return 8; }
+}
+
+// ============================================================
+// 动态 CSS(动画 + 仅代码区背景)—— 写入 cus-dynamic.css,走 external.imports
+// 关键修复:此版本 Custom UI Style 不注入 stylesheet 设置,只注入 imports 的文件。
+// 所以动画和背景都必须写成真实 CSS 文件。
+// ============================================================
+const CUS_DYNAMIC_CSS = path.join(USER_DIR, 'cus-dynamic.css');
+
+// {选择器: 规则} 对象 → CSS 文本
+function cssFromObj(obj) {
+    return Object.entries(obj).map(([sel, rule]) => `${sel} {\n    ${rule}\n}`).join('\n');
+}
+
+// 生成并写入 cus-dynamic.css;用注释标记当前 animMode / bgMode 供 readState 读取
+function writeDynamicCss(animMode, bgMode) {
+    const bgUrl = getChosenImage();
+    const op = vscode.workspace.getConfiguration().get('custom-ui-style.background.opacity') || 0.92;
+    let out = `/* 由美化控制台动态生成,勿手改 */\n/* ANIM:${animMode} */\n/* BG:${bgMode} */\n\n`;
+    // 动画段
+    const anim = ANIM_PRESETS[animMode] || {};
+    if (Object.keys(anim).length) out += '/* ---- 动画 ---- */\n' + cssFromObj(anim) + '\n\n';
+    // 仅代码区背景段(图转 base64 绕过 CSP)
+    if (bgMode === 'codeOnly' && bgUrl) {
+        const dataUri = imageToDataUri(bgUrl);
+        out += '/* ---- 仅代码区背景 ---- */\n' + cssFromObj(codeOnlyCss(dataUri, op)) + '\n';
+    }
+    try { fs.writeFileSync(CUS_DYNAMIC_CSS, out); return true; } catch (e) { return false; }
+}
+
+// 从 cus-dynamic.css 的标记注释读当前模式
+function readDynamicModes() {
+    try {
+        const c = fs.readFileSync(CUS_DYNAMIC_CSS, 'utf8');
+        const a = c.match(/ANIM:(\w+)/); const b = c.match(/BG:(\w+)/);
+        return { animMode: a ? a[1] : 'default', bgModeCss: b ? b[1] : 'off' };
+    } catch (e) { return { animMode: 'default', bgModeCss: 'off' }; }
+}
+
+// 常见编程字体候选(展示名 → 文件名关键字,用于检测是否已装)
+const CODING_FONTS = [
+    ['JetBrains Mono', 'jetbrainsmono'],
+    ['Fira Code', 'firacode'],
+    ['Cascadia Code', 'cascadiacode'],
+    ['Cascadia Mono', 'cascadiamono'],
+    ['Source Code Pro', 'sourcecodepro'],
+    ['Consolas', 'consola'],
+    ['Hack', 'hack'],
+    ['IBM Plex Mono', 'ibmplexmono'],
+    ['Roboto Mono', 'robotomono'],
+    ['Ubuntu Mono', 'ubuntumono'],
+    ['DejaVu Sans Mono', 'dejavusansmono'],
+    ['Courier New', 'cour'],
+    ['MesloLGS NF', 'meslolgs'],
+    ['Maple Mono', 'maplemono'],
+    ['Victor Mono', 'victormono'],
+    ['Operator Mono', 'operatormono']
+];
+
+// 扫描已安装字体文件名(小写去空格),用于标记哪些编程字体已装
+function scannedFontFiles() {
+    const dirs = [
+        path.join(process.env.LOCALAPPDATA || '', 'Microsoft/Windows/Fonts'),
+        'C:/Windows/Fonts'
+    ];
+    let names = new Set();
+    for (const d of dirs) {
+        try {
+            for (const f of fs.readdirSync(d)) {
+                if (/\.(ttf|otf|ttc)$/i.test(f)) names.add(f.toLowerCase().replace(/[\s_-]/g, ''));
+            }
+        } catch (e) { /* 目录不存在忽略 */ }
+    }
+    return names;
+}
+
+// 返回字体列表:[{name, installed}],已装的排前面
+function listFonts() {
+    const files = scannedFontFiles();
+    const arr = CODING_FONTS.map(([name, key]) => {
+        const installed = [...files].some(f => f.includes(key));
+        return { name, installed };
+    });
+    arr.sort((a, b) => (b.installed - a.installed));
+    return arr;
+}
+
+// 从 editor.fontFamily 里取出首选字体名(去引号)
+function currentFontName(ff) {
+    if (!ff) return 'JetBrains Mono';
+    const m = String(ff).match(/^\s*'?([^',]+)'?/);
+    return m ? m[1].trim() : 'JetBrains Mono';
+}
+
+function listThemes(kind) {
+    const out = [];
+    for (const ext of vscode.extensions.all) {
+        const contributes = ext.packageJSON && ext.packageJSON.contributes;
+        if (!contributes) continue;
+        const arr = kind === 'icon' ? contributes.iconThemes
+            : kind === 'product' ? contributes.productIconThemes
+            : contributes.themes;
+        if (Array.isArray(arr)) {
+            for (const t of arr) out.push(t.id || t.label || t.name);
+        }
+    }
+    return out;
+}
+
+// 读取当前所有面板关心的参数值
+function readState() {
+    const c = vscode.workspace.getConfiguration();
+    // 动画档位 + 仅代码区标记从 cus-dynamic.css 读
+    const dyn = readDynamicModes();
+    const animMode = dyn.animMode;
+    const fullUrl = c.get('custom-ui-style.background.url') || '';
+    // 背景模式:有 background.url = 全窗口;否则看 dynamic css 里是不是 codeOnly
+    let bgMode = 'off';
+    if (fullUrl) bgMode = 'full';
+    else if (dyn.bgModeCss === 'codeOnly') bgMode = 'codeOnly';
+    const bgUrl = getChosenImage();   // 面板显示用:当前选定的图(独立于模式)
+    return {
+        fontFamily: c.get('editor.fontFamily'),
+        fontName: currentFontName(c.get('editor.fontFamily')),
+        fonts: listFonts(),
+        fontSize: c.get('editor.fontSize'),
+        lineHeight: c.get('editor.lineHeight'),
+        fontWeight: c.get('editor.fontWeight'),
+        ligatures: c.get('editor.fontLigatures'),
+        statusBar: c.get('workbench.statusBar.visible'),
+        breadcrumbs: c.get('breadcrumbs.enabled'),
+        activityBar: c.get('workbench.activityBar.location'),
+        menuBar: c.get('window.menuBarVisibility'),
+        tabSizing: c.get('workbench.editor.tabSizing'),
+        cursorSmooth: c.get('editor.cursorSmoothCaretAnimation'),
+        smoothScroll: c.get('editor.smoothScrolling'),
+        bracketColor: c.get('editor.bracketPairColorization.enabled'),
+        indentGuides: c.get('editor.guides.indentation'),
+        stickyScroll: c.get('editor.stickyScroll.enabled'),
+        paddingTop: c.get('editor.padding.top'),
+        minimap: c.get('editor.minimap.enabled'),
+        animMode,
+        bgMode,
+        bgUrl,
+        bgOpacity: c.get('custom-ui-style.background.opacity'),
+        radius: getRadius(),
+        colorTheme: c.get('workbench.colorTheme'),
+        iconTheme: c.get('workbench.iconTheme'),
+        productIconTheme: c.get('workbench.productIconTheme'),
+        themes: listThemes('color'),
+        iconThemes: listThemes('icon'),
+        productThemes: listThemes('product')
+    };
+}
+
+// 自举:新机器上首次激活,自动创建所需 CSS 文件并登记到 Custom UI Style 的 imports
+const CUS_BASE_TEMPLATE = `/* 美化控制台基础样式:圆角 + 动画关键帧 */
+:root { --r: 8px; }
+.title-label > h2 { font-weight: 600; }
+.monaco-workbench .part.editor > .content .editor-group-container > .title div.tabs-container > .tab { border-radius: var(--r) var(--r) 0 0; margin: 2px 1px 0 1px; }
+.quick-input-widget { border-radius: calc(var(--r) + 2px); overflow: hidden; }
+.monaco-list-row { border-radius: calc(var(--r) - 2px); }
+.suggest-widget { border-radius: calc(var(--r) + 2px); overflow: hidden; }
+.monaco-hover { border-radius: var(--r); }
+.monaco-button { border-radius: calc(var(--r) - 2px); }
+.monaco-inputbox { border-radius: calc(var(--r) - 2px); }
+.monaco-workbench .notifications-toasts .notification-toast { border-radius: calc(var(--r) + 2px); overflow: hidden; }
+.monaco-workbench .activitybar .action-item { border-radius: var(--r); }
+.monaco-scrollable-element > .scrollbar > .slider { border-radius: calc(var(--r) - 2px); }
+@keyframes apc-fade-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes apc-fade-scale { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
+@keyframes apc-slide-in-left { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes apc-bounce-in { 0% { opacity: 0; transform: scale(0.9) translateY(-8px); } 60% { opacity: 1; transform: scale(1.02) translateY(2px); } 100% { opacity: 1; transform: scale(1) translateY(0); } }
+@keyframes apc-zoom-in { from { opacity: 0; transform: scale(0.92); } to { opacity: 1; transform: scale(1); } }
+@keyframes apc-flip-in { from { opacity: 0; transform: perspective(400px) rotateX(-12deg); } to { opacity: 1; transform: perspective(400px) rotateX(0); } }
+`;
+
+async function bootstrap() {
+    try {
+        // 1) 确保 cus-base.css 存在
+        if (!fs.existsSync(CUS_BASE_CSS)) fs.writeFileSync(CUS_BASE_CSS, CUS_BASE_TEMPLATE);
+        // 2) 确保 cus-dynamic.css 存在
+        if (!fs.existsSync(CUS_DYNAMIC_CSS) || fs.readFileSync(CUS_DYNAMIC_CSS, 'utf8').trim().length < 20) {
+            writeDynamicCss('default', 'off');
+        }
+        // 3) 确保两文件登记进 Custom UI Style 的 external.imports
+        const cfg = vscode.workspace.getConfiguration();
+        const imports = cfg.get('custom-ui-style.external.imports') || [];
+        const need = [
+            'file://' + CUS_BASE_CSS.replace(/\\/g, '/'),
+            'file://' + CUS_DYNAMIC_CSS.replace(/\\/g, '/')
+        ];
+        let changed = false;
+        for (const im of need) if (!imports.includes(im)) { imports.push(im); changed = true; }
+        if (changed) {
+            await cfg.update('custom-ui-style.external.imports', imports, vscode.ConfigurationTarget.Global);
+            await cfg.update('custom-ui-style.external.loadStrategy', 'refetch', vscode.ConfigurationTarget.Global);
+            await cfg.update('custom-ui-style.reloadWithoutPrompting', true, vscode.ConfigurationTarget.Global);
+        }
+    } catch (e) {}
+}
+
+function activate(context) {
+    let panel = null;
+    bootstrap();
+
+    context.subscriptions.push(vscode.commands.registerCommand('beautify.openPanel', () => {
+        if (panel) { panel.dispose(); panel = null; } // 强制重建,保证最新 HTML
+        panel = vscode.window.createWebviewPanel('beautifyPanel', '美化控制台', vscode.ViewColumn.Active,
+            { enableScripts: true, retainContextWhenHidden: true });
+        panel.webview.html = getHtml();
+        panel.onDidDispose(() => { panel = null; }, null, context.subscriptions);
+        panel.webview.postMessage({ type: 'init', state: readState() });
+        panel.webview.onDidReceiveMessage(msg => handleMessage(msg, panel), null, context.subscriptions);
+        // 切回面板重新可见时,补发一次最新状态,避免空白
+        panel.onDidChangeViewState(() => {
+            if (panel && panel.visible) panel.webview.postMessage({ type: 'init', state: readState() });
+        }, null, context.subscriptions);
+    }));
+
+    // 保留背景三命令(命令面板仍可直接用)
+    context.subscriptions.push(
+        vscode.commands.registerCommand('bgSwitcher.fullWindow', () => applyBg('full')),
+        vscode.commands.registerCommand('bgSwitcher.codeOnly', () => applyBg('codeOnly')),
+        vscode.commands.registerCommand('bgSwitcher.off', () => applyBg('off'))
+    );
+}
+
+// 默认无内置背景图,用户通过面板「选择图片」自行设置(可移植,不绑定特定机器)
+const DEFAULT_BG = '';
+// 「选了哪张图」独立持久化,与「用哪个模式」完全分开(修复选图跳全窗口的 bug)
+const CHOSEN_IMG_FILE = path.join(USER_DIR, '.beautify-bg-image');
+function getChosenImage() {
+    try { const v = fs.readFileSync(CHOSEN_IMG_FILE, 'utf8').trim(); return v || DEFAULT_BG; }
+    catch (e) { return DEFAULT_BG; }
+}
+function setChosenImage(url) {
+    try { fs.writeFileSync(CHOSEN_IMG_FILE, url || ''); } catch (e) {}
+}
+
+// 背景模式应用 —— 全窗口用 background.url;仅代码区写进 cus-dynamic.css;动画保持
+async function applyBg(mode, noReload) {
+    const bgUrl = getChosenImage();
+    const animMode = readDynamicModes().animMode;
+    if (mode === 'full') {
+        // 全窗口:CUS 内建背景显示;dynamic css 只留动画(bg=off)
+        await setConfig([['custom-ui-style.background.url', bgUrl]]);
+        writeDynamicCss(animMode, 'off');
+    } else if (mode === 'codeOnly') {
+        // 仅代码区:清 url,把背景 CSS 写进 dynamic css
+        await setConfig([['custom-ui-style.background.url', '']]);
+        writeDynamicCss(animMode, 'codeOnly');
+    } else {
+        await setConfig([['custom-ui-style.background.url', '']]);
+        writeDynamicCss(animMode, 'off');
+    }
+    if (!noReload) await reloadCUS();
+}
+
+// 参数键 → VS Code 设置键 映射(原生即时生效类)
+const NATIVE_MAP = {
+    fontFamily: 'editor.fontFamily', fontSize: 'editor.fontSize', lineHeight: 'editor.lineHeight',
+    fontWeight: 'editor.fontWeight', ligatures: 'editor.fontLigatures',
+    statusBar: 'workbench.statusBar.visible', breadcrumbs: 'breadcrumbs.enabled',
+    activityBar: 'workbench.activityBar.location', menuBar: 'window.menuBarVisibility',
+    tabSizing: 'workbench.editor.tabSizing', cursorSmooth: 'editor.cursorSmoothCaretAnimation',
+    smoothScroll: 'editor.smoothScrolling', bracketColor: 'editor.bracketPairColorization.enabled',
+    indentGuides: 'editor.guides.indentation', stickyScroll: 'editor.stickyScroll.enabled',
+    minimap: 'editor.minimap.enabled',
+    colorTheme: 'workbench.colorTheme', iconTheme: 'workbench.iconTheme',
+    productIconTheme: 'workbench.productIconTheme'
+};
+
+// 标记「待重启」:不立即 reload,通知前端点亮重启条,并弹一次 notification
+let pendingRestart = false;
+function markRestart(panel) {
+    pendingRestart = true;
+    if (panel) panel.webview.postMessage({ type: 'pendingRestart' });
+    promptRestart();
+}
+let promptShown = false;
+async function promptRestart() {
+    if (promptShown) return;
+    promptShown = true;
+    const pick = await vscode.window.showInformationMessage(
+        '美化改动需要重启窗口才能生效', '立即重启', '稍后');
+    promptShown = false;
+    if (pick === '立即重启') { pendingRestart = false; await reloadCUS(); }
+}
+
+async function handleMessage(msg, panel) {
+    try {
+        if (msg.type === 'setFont') {
+            // 选字体名 → 组装带 fallback 的 fontFamily(编辑器+终端一起)
+            const ff = `'${msg.value}', Consolas, 'Courier New', monospace`;
+            await setConfig([
+                ['editor.fontFamily', ff],
+                ['terminal.integrated.fontFamily', `'${msg.value}', monospace`]
+            ]);
+        } else if (msg.type === 'setNative') {
+            const key = NATIVE_MAP[msg.key];
+            if (key) { await setConfig([[key, msg.value]]); }
+            if (msg.key === 'paddingTop') await setConfig([['editor.padding.top', msg.value], ['editor.padding.bottom', msg.value]]);
+            // 原生参数即时生效,无需重启
+        } else if (msg.type === 'setAnim') {
+            // 动画写进 cus-dynamic.css(保持当前背景模式)
+            const bgm = readState().bgMode;
+            writeDynamicCss(msg.value, bgm === 'codeOnly' ? 'codeOnly' : 'off');
+            markRestart(panel);
+        } else if (msg.type === 'setBg') {
+            await applyBg(msg.value, true);
+            markRestart(panel);
+        } else if (msg.type === 'setBgOpacity') {
+            await setConfig([['custom-ui-style.background.opacity', msg.value]]);
+            // codeOnly 模式下 opacity 在 dynamic css 里,需重写
+            const st = readState();
+            if (st.bgMode === 'codeOnly') writeDynamicCss(st.animMode, 'codeOnly');
+            markRestart(panel);
+        } else if (msg.type === 'pickImage') {
+            const uri = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { 图片: ['png', 'jpg', 'jpeg', 'webp'] } });
+            if (uri && uri[0]) {
+                const p = uri[0].fsPath;
+                const dest = path.join(USER_DIR, 'backgrounds', path.basename(p));
+                fs.mkdirSync(path.dirname(dest), { recursive: true });
+                fs.copyFileSync(p, dest);
+                const url = 'file:///' + dest.replace(/\\/g, '/');
+                // 只存图,不改模式:保存到独立文件,再按【当前模式】重新应用
+                setChosenImage(url);
+                const curMode = readState().bgMode;
+                // 若当前没开背景(off),选图后默认用全窗口;否则保持当前模式
+                await applyBg(curMode === 'off' ? 'full' : curMode, true);
+                panel.webview.postMessage({ type: 'init', state: readState() });
+                markRestart(panel);
+            }
+        } else if (msg.type === 'setRadius') {
+            if (setRadius(msg.value)) markRestart(panel);
+        } else if (msg.type === 'reload' || msg.type === 'doRestart') {
+            pendingRestart = false;
+            await reloadCUS();
+        } else if (msg.type === 'restore') {
+            await restoreDefaults(panel);
+            panel.webview.postMessage({ type: 'init', state: readState() });
+        } else if (msg.type === 'refresh') {
+            panel.webview.postMessage({ type: 'init', state: readState() });
+        }
+    } catch (e) {
+        vscode.window.showErrorMessage('美化控制台: ' + e.message);
+    }
+}
+
+// 恢复默认 —— 复位到我们这套 JetBrains 配置(固定快照)
+async function restoreDefaults(panel) {
+    await setConfig([
+        ['editor.fontFamily', "'JetBrains Mono', Consolas, 'Courier New', monospace"],
+        ['editor.fontSize', 14],
+        ['editor.lineHeight', 1.6],
+        ['editor.fontWeight', '400'],
+        ['editor.fontLigatures', true],
+        ['workbench.statusBar.visible', true],
+        ['breadcrumbs.enabled', true],
+        ['workbench.activityBar.location', 'top'],
+        ['window.menuBarVisibility', 'compact'],
+        ['workbench.editor.tabSizing', 'shrink'],
+        ['editor.cursorSmoothCaretAnimation', 'on'],
+        ['editor.smoothScrolling', true],
+        ['editor.bracketPairColorization.enabled', true],
+        ['editor.guides.indentation', true],
+        ['editor.stickyScroll.enabled', true],
+        ['editor.minimap.enabled', true],
+        ['editor.padding.top', 10],
+        ['editor.padding.bottom', 10],
+        ['workbench.colorTheme', 'Int UI Dark'],
+        ['workbench.iconTheme', 'int-ui-icons-dark'],
+        ['workbench.productIconTheme', 'jetbrains-product-icon-theme']
+    ]);
+    // 圆角复位、不透明度复位
+    await setConfig([['custom-ui-style.background.opacity', 0.92]]);
+    setRadius(8);
+    // 恢复默认 = 干净 JetBrains 外观:动画回 default 档,背景图关闭
+    await setConfig([['custom-ui-style.background.url', '']]);
+    await setConfig([['custom-ui-style.stylesheet', {}]]);  // 清空失效的旧设置残留
+    writeDynamicCss('default', 'off');
+    pendingRestart = false;
+    await reloadCUS();
+    vscode.window.showInformationMessage('已恢复默认 JetBrains 外观(已移除背景图)。');
+}
+
+function deactivate() {}
+module.exports = { activate, deactivate };
+
+function getHtml() {
+    return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: https: file: vscode-resource:; script-src 'unsafe-inline';">
+<style>
+:root {
+    --bg: #1e1f22; --panel: #2b2d30; --fg: #bcbec4; --muted: #8a8e96;
+    --blue: #3574f0; --border: #393b40; --radius: 8px;
+}
+* { box-sizing: border-box; }
+body {
+    background: var(--bg); color: var(--fg); margin: 0; padding: 0;
+    font-family: 'JetBrains Mono', -apple-system, sans-serif; font-size: 13px;
+}
+.header {
+    position: sticky; top: 0; background: var(--panel); padding: 14px 20px;
+    border-bottom: 1px solid var(--border); display: flex; align-items: center;
+    justify-content: space-between; z-index: 10;
+}
+.header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+.header .actions button { margin-left: 8px; }
+.wrap { padding: 16px 20px 40px; max-width: 720px; }
+.section {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); margin-bottom: 14px; overflow: visible;
+}
+.section h2 {
+    font-size: 13px; margin: 0; padding: 10px 14px; background: #26282e;
+    color: var(--muted); font-weight: 600; letter-spacing: .5px;
+    border-radius: var(--radius) var(--radius) 0 0;
+}
+.row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 14px; border-top: 1px solid var(--border); gap: 12px;
+}
+.row:first-of-type { border-top: none; }
+.row label { flex: 0 0 auto; }
+.row .ctrl { flex: 1 1 auto; display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
+/* JetBrains 风格输入框 */
+input[type=text] {
+    background: #1e1f22; color: var(--fg); border: 1px solid #4e5157;
+    border-radius: 4px; padding: 5px 9px; font-family: inherit; font-size: 12px; min-width: 150px;
+}
+/* JetBrains 风格下拉框(自绘箭头,SVG 完整 URL 编码) */
+select {
+    -webkit-appearance: none; -moz-appearance: none; appearance: none;
+    background-color: #1e1f22; color: #bcbec4; border: 1px solid #4e5157;
+    border-radius: 4px; padding: 5px 28px 5px 9px; font-family: inherit; font-size: 12px; min-width: 160px;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='10'%20height='6'%20viewBox='0%200%2010%206'%3E%3Cpath%20d='M1%201l4%204%204-4'%20stroke='%238a8e96'%20stroke-width='1.4'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 10px center;
+}
+select:hover { border-color: #6f737a; }
+select:focus { border-color: var(--blue); outline: none; }
+option { background-color: #2b2d30; color: #bcbec4; }
+/* JetBrains 风格滑条 */
+input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 170px; height: 4px;
+    background: #4e5157; border-radius: 2px; cursor: pointer;
+}
+input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; width: 14px; height: 14px;
+    border-radius: 50%; background: var(--blue); border: 2px solid #1e1f22;
+    box-shadow: 0 0 0 1px var(--blue);
+}
+.val { color: var(--blue); min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; }
+button {
+    background: var(--blue); color: #fff; border: none; border-radius: 6px;
+    padding: 6px 14px; cursor: pointer; font-family: inherit; font-size: 12px;
+}
+button.ghost { background: transparent; border: 1px solid var(--border); color: var(--fg); }
+button:hover { filter: brightness(1.1); }
+.seg { display: flex; gap: 0; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg button { background: var(--bg); color: var(--fg); border-radius: 0; border-right: 1px solid var(--border); padding: 5px 12px; }
+.seg button:last-child { border-right: none; }
+.seg button.on { background: var(--blue); color: #fff; }
+.switch { position: relative; width: 38px; height: 20px; }
+.switch input { display: none; }
+.slider-sw {
+    position: absolute; inset: 0; background: var(--border); border-radius: 20px;
+    cursor: pointer; transition: background .2s;
+}
+.slider-sw:before {
+    content: ''; position: absolute; width: 16px; height: 16px; left: 2px; top: 2px;
+    background: #fff; border-radius: 50%; transition: transform .2s;
+}
+input:checked + .slider-sw { background: var(--blue); }
+input:checked + .slider-sw:before { transform: translateX(18px); }
+.hint { color: var(--muted); font-size: 11px; padding: 2px 14px 10px; }
+
+/* —— 面板入场动画 —— */
+@keyframes secIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+.section { animation: secIn .38s cubic-bezier(0.22,0.61,0.36,1) backwards; position: relative; }
+/* 含 hover 问号的区块提到最上层,tooltip 不被后面区块盖住 */
+.section:hover { z-index: 50; }
+.section:nth-child(1){animation-delay:.03s}
+.section:nth-child(2){animation-delay:.08s}
+.section:nth-child(3){animation-delay:.13s}
+.section:nth-child(4){animation-delay:.18s}
+.section:nth-child(5){animation-delay:.23s}
+.section:nth-child(6){animation-delay:.28s}
+.header h1 { animation: secIn .5s ease both; }
+
+/* —— 控件交互动画 —— */
+.row { transition: background-color .16s ease; }
+.row:hover { background-color: rgba(255,255,255,0.03); }
+button { transition: filter .15s ease, transform .1s ease, background-color .16s ease; }
+button:active { transform: scale(0.96); }
+.seg button { transition: background-color .18s ease, color .18s ease; }
+select, input[type=text] { transition: border-color .16s ease, box-shadow .16s ease; }
+select:focus, input[type=text]:focus { border-color: var(--blue); box-shadow: 0 0 0 2px rgba(53,116,240,0.25); outline: none; }
+.slider-sw, .slider-sw:before { transition: background .22s ease, transform .22s cubic-bezier(0.34,1.56,0.64,1); }
+input[type=range]::-webkit-slider-thumb { transition: transform .12s ease; }
+input[type=range]:active::-webkit-slider-thumb { transform: scale(1.25); }
+
+/* 需重载标记 */
+.badge { font-size: 10px; color: var(--blue); border: 1px solid var(--blue); border-radius: 4px; padding: 1px 5px; margin-left: 6px; opacity: .8; }
+.toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(20px);
+    background: var(--blue); color: #fff; padding: 8px 18px; border-radius: 8px;
+    opacity: 0; transition: opacity .25s, transform .25s; pointer-events: none; z-index: 100;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* 待重启横幅 */
+.restart-bar {
+    position: sticky; top: 52px; z-index: 9;
+    display: none; align-items: center; justify-content: space-between;
+    background: #3574f022; border: 1px solid var(--blue); border-radius: 8px;
+    margin: 12px 20px 0; padding: 8px 14px; animation: secIn .3s ease;
+}
+.restart-bar.show { display: flex; }
+.restart-bar span { color: #cdd3e0; font-size: 12px; }
+
+/* —— 问号 tooltip —— */
+.q {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 15px; height: 15px; margin-left: 6px; border-radius: 50%;
+    border: 1px solid var(--muted); color: var(--muted);
+    font-size: 10px; line-height: 1; cursor: help; user-select: none;
+    vertical-align: middle; position: relative;
+    transition: transform .18s cubic-bezier(0.34,1.56,0.64,1), color .18s ease, border-color .18s ease;
+}
+.q:hover, .q:focus { transform: scale(1.2); color: #fff; border-color: var(--blue); background: var(--blue); outline: none; }
+.q::after {
+    content: attr(data-tip);
+    /* 往右侧空白区展开,垂直居中于问号,不盖住下面的行、也不挡右侧控件 */
+    position: absolute; left: calc(100% + 10px); top: 50%; z-index: 500;
+    width: 250px; max-width: 250px; white-space: normal; text-align: left; word-break: break-word;
+    background: #2b2d30; color: #cdd3e0; border: 1px solid #4e5157;
+    border-radius: 8px; padding: 9px 12px; font-size: 11.5px; line-height: 1.7;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    opacity: 0; transform: translateY(-50%) translateX(-4px); pointer-events: none;
+    transition: opacity .18s ease, transform .18s cubic-bezier(0.22,0.61,0.36,1);
+}
+.q:hover::after, .q:focus::after { opacity: 1; transform: translateY(-50%) translateX(0); }
+.row label { display: inline-flex; align-items: center; }
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>🎨 美化控制台 <span style="font-size:11px;color:var(--muted);font-weight:400">v13</span></h1>
+    <div class="actions">
+        <button class="ghost" id="btnRestore">恢复默认</button>
+        <button class="ghost" id="btnRefresh">刷新</button>
+        <button id="btnReload">应用并重载</button>
+    </div>
+</div>
+<div class="restart-bar" id="restartBar">
+    <span>⚡ 有改动需要重启窗口才能生效</span>
+    <button id="btnDoRestart">立即重启</button>
+</div>
+<div class="wrap">
+
+    <div class="section">
+        <h2>字体</h2>
+        <div class="row"><label>代码字体<span class="q" tabindex="0" data-tip="写代码时字的样子。等宽字体每个字符宽度一样,代码更整齐。带 ✓ 的是你电脑已经装好的字体。">?</span></label><div class="ctrl"><select id="fontName"></select></div></div>
+        <div class="row"><label>字号<span class="q" tabindex="0" data-tip="字的大小,单位像素(px)。看久了眼睛累就调大一点。">?</span></label><div class="ctrl"><input type="range" id="fontSize" min="10" max="24" step="1"><span class="val" id="fontSizeV"></span></div></div>
+        <div class="row"><label>行高<span class="q" tabindex="0" data-tip="每一行之间的上下间距。数值大一点行与行更透气、不拥挤。">?</span></label><div class="ctrl"><input type="range" id="lineHeight" min="1" max="2.4" step="0.1"><span class="val" id="lineHeightV"></span></div></div>
+        <div class="row"><label>字重<span class="q" tabindex="0" data-tip="字的粗细。400 是正常,600 偏粗。数字越大越粗。">?</span></label><div class="ctrl"><select id="fontWeight"><option>300</option><option>400</option><option>500</option><option>600</option></select></div></div>
+        <div class="row"><label>连字 (ligatures)<span class="q" tabindex="0" data-tip="把 => != === 这类符号显示成更好看的合并样式。纯粹是视觉美化,不改变代码本身。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="ligatures"><span class="slider-sw"></span></label></div></div>
+    </div>
+
+    <div class="section">
+        <h2>布局</h2>
+        <div class="row"><label>状态栏<span class="q" tabindex="0" data-tip="窗口最底部那条信息栏,显示 Git 分支、光标行列、文件编码等。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="statusBar"><span class="slider-sw"></span></label></div></div>
+        <div class="row"><label>面包屑导航<span class="q" tabindex="0" data-tip="编辑器顶部显示当前文件的路径层级(如 src > main > App.java),点它能快速跳转。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="breadcrumbs"><span class="slider-sw"></span></label></div></div>
+        <div class="row"><label>活动栏位置<span class="q" tabindex="0" data-tip="最左边那排大图标(资源管理器/搜索/Git)放在哪。放顶部更接近 IntelliJ 的样子。">?</span></label><div class="ctrl"><select id="activityBar"><option value="top">顶部</option><option value="default">默认(左侧)</option><option value="bottom">底部</option><option value="hidden">隐藏</option></select></div></div>
+        <div class="row"><label>菜单栏<span class="q" tabindex="0" data-tip="文件/编辑/查看那一排菜单。紧凑=收成一个汉堡按钮,更省空间。">?</span></label><div class="ctrl"><select id="menuBar"><option value="compact">紧凑(汉堡)</option><option value="visible">显示</option><option value="hidden">隐藏</option></select></div></div>
+        <div class="row"><label>标签页缩放<span class="q" tabindex="0" data-tip="打开很多文件时,顶部一排标签怎么排。收缩=自动变窄尽量都塞下。">?</span></label><div class="ctrl"><select id="tabSizing"><option value="fit">适应</option><option value="shrink">收缩</option><option value="fixed">固定</option></select></div></div>
+    </div>
+
+    <div class="section">
+        <h2>编辑器</h2>
+        <div class="row"><label>光标平滑动画<span class="q" tabindex="0" data-tip="光标移动时平滑滑过去,而不是瞬间跳到新位置。">?</span></label><div class="ctrl"><select id="cursorSmooth"><option value="on">开</option><option value="off">关</option></select></div></div>
+        <div class="row"><label>平滑滚动<span class="q" tabindex="0" data-tip="滚动页面时带一点缓冲惯性,不是生硬地一格一格跳。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="smoothScroll"><span class="slider-sw"></span></label></div></div>
+        <div class="row"><label>括号配对染色<span class="q" tabindex="0" data-tip="把成对的括号 ( ) { } [ ] 用不同颜色区分,一眼看清嵌套层级。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="bracketColor"><span class="slider-sw"></span></label></div></div>
+        <div class="row"><label>缩进参考线<span class="q" tabindex="0" data-tip="每一层缩进画一条淡淡的竖线,方便看清代码块的层级。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="indentGuides"><span class="slider-sw"></span></label></div></div>
+        <div class="row"><label>粘性滚动<span class="q" tabindex="0" data-tip="往下滚代码时,当前所在的函数名/类名会固定贴在编辑器顶部,不会滚没看不见。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="stickyScroll"><span class="slider-sw"></span></label></div></div>
+        <div class="row"><label>缩略图 (minimap)<span class="q" tabindex="0" data-tip="编辑器右侧那条代码全景小图,拖动它能快速跳到文件任意位置。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="minimap"><span class="slider-sw"></span></label></div></div>
+        <div class="row"><label>上下内边距<span class="q" tabindex="0" data-tip="代码区顶部和底部留的空白,单位像素。大一点更透气。">?</span></label><div class="ctrl"><input type="range" id="paddingTop" min="0" max="30" step="2"><span class="val" id="paddingTopV"></span></div></div>
+    </div>
+
+    <div class="section">
+        <h2>动画 <span class="badge">需重载</span></h2>
+        <div class="row"><label>动画档位<span class="q" tabindex="0" data-tip="界面里各种弹窗/菜单/切换的动画风格。默认=淡入,平滑=只有过渡不花哨,弹跳=带回弹,华丽=翻转缩放最丰富,关闭=无动画。越往右越花哨。">?</span></label><div class="ctrl"><div class="seg" id="animSeg">
+            <button data-v="default">默认</button><button data-v="smooth">平滑</button><button data-v="bounce">弹跳</button><button data-v="fancy">华丽</button><button data-v="off">关闭</button>
+        </div></div></div>
+        <div class="hint">默认=淡入 · 平滑=仅过渡 · 弹跳=回弹 · 华丽=翻转缩放 · 改动画会重载窗口</div>
+    </div>
+
+    <div class="section">
+        <h2>背景图 <span class="badge">需重载</span></h2>
+        <div class="row"><label>模式<span class="q" tabindex="0" data-tip="背景图铺在哪:全窗口=整个界面都铺 / 仅代码区=只在编辑代码的区域 / 关闭=不要背景图。">?</span></label><div class="ctrl"><div class="seg" id="bgSeg">
+            <button data-v="full">全窗口</button><button data-v="codeOnly">仅代码区</button><button data-v="off">关闭</button>
+        </div></div></div>
+        <div class="row"><label>图片<span class="q" tabindex="0" data-tip="选一张图片当背景。选好后会自动复制到安全位置,不怕原图被移动或删除。">?</span></label><div class="ctrl"><button class="ghost" id="btnPick">选择图片…</button></div></div>
+        <div class="row"><label>不透明度<span class="q" tabindex="0" data-tip="背景图的浓淡程度。数值越小图越淡、代码越清晰;越大图越明显。">?</span></label><div class="ctrl"><input type="range" id="bgOpacity" min="0.7" max="1" step="0.01"><span class="val" id="bgOpacityV"></span></div></div>
+        <div class="hint">改背景会重载窗口</div>
+    </div>
+
+    <div class="section">
+        <h2>颜色主题</h2>
+        <div class="row"><label>配色主题<span class="q" tabindex="0" data-tip="整体的颜色方案(代码高亮+界面色)。Int UI Dark 就是 JetBrains 的深色主题。">?</span></label><div class="ctrl"><select id="colorTheme"></select></div></div>
+        <div class="row"><label>文件图标<span class="q" tabindex="0" data-tip="文件树里每个文件/文件夹前面那个小图标的风格。">?</span></label><div class="ctrl"><select id="iconTheme"></select></div></div>
+        <div class="row"><label>产品图标<span class="q" tabindex="0" data-tip="界面功能按钮(设置齿轮/搜索/源代码管理等)的图标风格。">?</span></label><div class="ctrl"><select id="productIconTheme"></select></div></div>
+        <div class="row"><label>圆角大小<span class="q" tabindex="0" data-tip="标签页/面板/按钮的边角圆润程度,单位像素。0=直角,越大越圆。">?</span></label><div class="ctrl"><input type="range" id="radius" min="0" max="16" step="1"><span class="val" id="radiusV"></span></div></div>
+        <div class="hint">改圆角会重载窗口</div>
+    </div>
+
+</div>
+<div class="toast" id="toast">已应用</div>
+<script>const vscode = acquireVsCodeApi();
+const $ = id => document.getElementById(id);
+let toastT;
+function showToast(txt){
+    const t = $('toast'); t.textContent = txt || '已应用'; t.classList.add('show');
+    clearTimeout(toastT); toastT = setTimeout(()=> t.classList.remove('show'), 900);
+}
+function post(m){ vscode.postMessage(m); if(m.type==='setNative'||m.type==='setFont') showToast('已实时应用'); }
+function fillSelect(el, items, cur){
+    el.innerHTML='';
+    (items||[]).forEach(v=>{ const o=document.createElement('option'); o.value=v; o.textContent=v; if(v===cur)o.selected=true; el.appendChild(o); });
+}
+function setSeg(segId, val){
+    document.querySelectorAll('#'+segId+' button').forEach(b=>b.classList.toggle('on', b.dataset.v===val));
+}
+
+let S = vscode.getState() || {};   // 切回来时用缓存的状态,避免空白
+window.addEventListener('message', e => {
+    const m = e.data;
+    if (m.type === 'init') { S = m.state; vscode.setState(S); render(); $('restartBar').classList.remove('show'); }
+    else if (m.type === 'pendingRestart') { $('restartBar').classList.add('show'); }
+});
+// 面板加载/切回可见时,主动向后端要一次最新状态
+window.addEventListener('load', ()=> vscode.postMessage({type:'refresh'}));
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) vscode.postMessage({type:'refresh'}); });
+// 先用缓存渲染一次(即使还没收到 init 也不空白)
+if (S && S.fonts) render();
+
+function render(){
+    // 字体下拉:已装的标 ✓,未装的标(未安装)
+    const fsel = $('fontName'); fsel.innerHTML='';
+    let fonts = S.fonts;
+    // 兜底:若后端没返回字体列表,至少给一组常见字体,避免空白
+    if (!fonts || !fonts.length) {
+        fonts = ['JetBrains Mono','Fira Code','Cascadia Code','Consolas','Source Code Pro','Courier New']
+            .map(n => ({ name: n, installed: false }));
+    }
+    fonts.forEach(f=>{
+        const o=document.createElement('option'); o.value=f.name;
+        o.textContent = f.name + (f.installed ? '  ✓' : '');
+        if(f.name===(S.fontName||'JetBrains Mono')) o.selected=true;
+        fsel.appendChild(o);
+    });
+    $('fontSize').value = S.fontSize || 14; $('fontSizeV').textContent = S.fontSize || 14;
+    $('lineHeight').value = S.lineHeight || 1.6; $('lineHeightV').textContent = (S.lineHeight||1.6);
+    $('fontWeight').value = String(S.fontWeight || '400');
+    $('ligatures').checked = !!S.ligatures;
+    $('statusBar').checked = S.statusBar !== false;
+    $('breadcrumbs').checked = !!S.breadcrumbs;
+    $('activityBar').value = S.activityBar || 'top';
+    $('menuBar').value = S.menuBar || 'compact';
+    $('tabSizing').value = S.tabSizing || 'shrink';
+    $('cursorSmooth').value = S.cursorSmooth || 'on';
+    $('smoothScroll').checked = !!S.smoothScroll;
+    $('bracketColor').checked = !!S.bracketColor;
+    $('indentGuides').checked = !!S.indentGuides;
+    $('stickyScroll').checked = !!S.stickyScroll;
+    $('minimap').checked = !!S.minimap;
+    $('paddingTop').value = S.paddingTop || 10; $('paddingTopV').textContent = (S.paddingTop||10);
+    setSeg('animSeg', S.animMode || 'off');
+    setSeg('bgSeg', S.bgMode || 'off');
+    $('bgOpacity').value = S.bgOpacity || 0.92; $('bgOpacityV').textContent = (S.bgOpacity||0.92);
+    fillSelect($('colorTheme'), S.themes, S.colorTheme);
+    fillSelect($('iconTheme'), S.iconThemes, S.iconTheme);
+    fillSelect($('productIconTheme'), S.productThemes, S.productIconTheme);
+    $('radius').value = S.radius || 8; $('radiusV').textContent = (S.radius || 8);
+}
+// —— 原生即时生效类 ——
+function bindNative(id, key, ev){
+    const el = $(id);
+    el.addEventListener(ev || 'change', () => {
+        let v;
+        if (el.type === 'checkbox') v = el.checked;
+        else v = el.value;
+        // 数值类转换
+        if (id === 'fontSize' || id === 'paddingTop') v = parseInt(v, 10);
+        if (id === 'lineHeight') v = parseFloat(v);
+        post({ type:'setNative', key, value: v });
+    });
+}
+$('fontName').addEventListener('change', ()=>{ post({type:'setFont', value: $('fontName').value}); });
+bindNative('fontWeight','fontWeight');
+bindNative('ligatures','ligatures');
+bindNative('statusBar','statusBar');
+bindNative('breadcrumbs','breadcrumbs');
+bindNative('activityBar','activityBar');
+bindNative('menuBar','menuBar');
+bindNative('tabSizing','tabSizing');
+bindNative('cursorSmooth','cursorSmooth');
+bindNative('smoothScroll','smoothScroll');
+bindNative('bracketColor','bracketColor');
+bindNative('indentGuides','indentGuides');
+bindNative('stickyScroll','stickyScroll');
+bindNative('minimap','minimap');
+bindNative('colorTheme','colorTheme');
+bindNative('iconTheme','iconTheme');
+bindNative('productIconTheme','productIconTheme');
+
+// debounce 工具:拖动时高频事件,120ms 内合并,实现"实时但不刷爆"
+function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
+
+// —— 原生滑块:拖动实时生效(数字即时更新 + debounce 应用) ——
+function liveSlider(id, key, parse){
+    const el = $(id), lbl = $(id+'V');
+    const send = debounce(v => post({type:'setNative', key, value: v}), 120);
+    el.addEventListener('input', ()=>{
+        const raw = parse(el.value);
+        lbl.textContent = el.value;
+        send(raw);
+    });
+}
+liveSlider('fontSize','fontSize', v=>parseInt(v,10));
+liveSlider('lineHeight','lineHeight', v=>parseFloat(v));
+liveSlider('paddingTop','paddingTop', v=>parseInt(v,10));
+
+// —— 需重载类:数字实时更新,但松手(change)才应用+重载(避免拖动中反复重载) ——
+$('bgOpacity').addEventListener('input', ()=> $('bgOpacityV').textContent = $('bgOpacity').value);
+$('radius').addEventListener('input', ()=> $('radiusV').textContent = $('radius').value);
+$('bgOpacity').addEventListener('change', ()=> post({type:'setBgOpacity', value: parseFloat($('bgOpacity').value)}));
+$('radius').addEventListener('change', ()=> post({type:'setRadius', value: parseInt($('radius').value,10)}));
+
+document.querySelectorAll('#animSeg button').forEach(b=>b.addEventListener('click',()=>{
+    setSeg('animSeg', b.dataset.v); post({type:'setAnim', value:b.dataset.v});
+}));
+document.querySelectorAll('#bgSeg button').forEach(b=>b.addEventListener('click',()=>{
+    setSeg('bgSeg', b.dataset.v); post({type:'setBg', value:b.dataset.v});
+}));
+
+$('btnPick').addEventListener('click', ()=> post({type:'pickImage'}));
+$('btnReload').addEventListener('click', ()=> post({type:'reload'}));
+$('btnRefresh').addEventListener('click', ()=> post({type:'refresh'}));
+$('btnRestore').addEventListener('click', ()=>{ vscode.postMessage({type:'restore'}); showToast('正在恢复默认…'); });
+$('btnDoRestart').addEventListener('click', ()=>{ vscode.postMessage({type:'doRestart'}); });</script>
+</body>
+</html>`;
+}
+
+
+
+

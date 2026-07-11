@@ -1,0 +1,28 @@
+{
+    "name": "beautify-console",
+    "displayName": "美化控制台 Beautify Console",
+    "description": "VS Code 一站式可视化美化面板:字体/布局/编辑器/动画/多区域背景图/圆角/主题,支持轮播、自定义 CSS、配置导入导出。A visual beautify panel for VS Code.",
+    "version": "1.0.0",
+    "publisher": "dwgx",
+    "license": "MIT",
+    "engines": {
+        "vscode": "^1.90.0"
+    },
+    "categories": ["Other"],
+    "keywords": ["theme", "background", "beautify", "ui", "jetbrains", "美化"],
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/dwgx/beautify-console"
+    },
+    "extensionDependencies": ["subframe7536.custom-ui-style"],
+    "activationEvents": ["onStartupFinished"],
+    "main": "./extension.js",
+    "contributes": {
+        "commands": [
+            { "command": "beautify.openPanel", "title": "美化: 打开控制台" },
+            { "command": "bgSwitcher.fullWindow", "title": "美化: 背景-全窗口" },
+            { "command": "bgSwitcher.codeOnly", "title": "美化: 背景-仅代码区" },
+            { "command": "bgSwitcher.off", "title": "美化: 背景-关闭" }
+        ]
+    }
+}

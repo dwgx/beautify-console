@@ -1,0 +1,58 @@
+/* ============================================================
+   Custom UI Style 基础样式(静态,常驻)
+   内容: 圆角/间距 + 动画关键帧定义(@keyframes)
+   动画的「启用与否」由 settings.json 的 custom-ui-style.stylesheet
+   三档切换控制(off/smooth/default),此文件只提供关键帧,不主动播放。
+   ============================================================ */
+
+/* ---- 圆角基准变量(由美化控制台修改这一行的数值,可反复改不损坏) ---- */
+:root { --r: 8px; }
+
+/* ---- 圆角 / 间距(全部引用变量) ---- */
+.title-label > h2 { font-weight: 600; }
+.monaco-workbench .part.editor > .content .editor-group-container > .title div.tabs-container > .tab {
+    border-radius: var(--r) var(--r) 0 0;
+    margin: 2px 1px 0 1px;
+}
+.quick-input-widget { border-radius: calc(var(--r) + 2px); overflow: hidden; }
+.monaco-list-row { border-radius: calc(var(--r) - 2px); }
+.monaco-workbench .monaco-list:not(.element-focused):focus:before { display: none; }
+.monaco-editor .rounded-highlight { border-radius: calc(var(--r) - 4px); }
+.suggest-widget { border-radius: calc(var(--r) + 2px); overflow: hidden; }
+.monaco-hover { border-radius: var(--r); }
+.editor-widget.find-widget { border-radius: 0 0 var(--r) var(--r); }
+.monaco-workbench .part > .composite.title-actions .action-item { border-radius: calc(var(--r) - 2px); }
+.monaco-button { border-radius: calc(var(--r) - 2px); }
+.monaco-inputbox { border-radius: calc(var(--r) - 2px); }
+.monaco-workbench .notifications-toasts .notification-toast { border-radius: calc(var(--r) + 2px); overflow: hidden; }
+.monaco-workbench .activitybar .action-item { border-radius: var(--r); }
+.monaco-workbench .activitybar .action-label { border-radius: var(--r); }
+.monaco-scrollable-element > .scrollbar > .slider { border-radius: calc(var(--r) - 2px); }
+.monaco-workbench .part.statusbar { font-size: 12px; }
+
+/* ---- 动画关键帧定义(供 default 档引用) ---- */
+@keyframes apc-fade-in {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes apc-fade-scale {
+    from { opacity: 0; transform: scale(0.98); }
+    to   { opacity: 1; transform: scale(1); }
+}
+@keyframes apc-slide-in-left {
+    from { opacity: 0; transform: translateX(-10px); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes apc-bounce-in {
+    0%   { opacity: 0; transform: scale(0.9) translateY(-8px); }
+    60%  { opacity: 1; transform: scale(1.02) translateY(2px); }
+    100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes apc-zoom-in {
+    from { opacity: 0; transform: scale(0.92); }
+    to   { opacity: 1; transform: scale(1); }
+}
+@keyframes apc-flip-in {
+    from { opacity: 0; transform: perspective(400px) rotateX(-12deg); }
+    to   { opacity: 1; transform: perspective(400px) rotateX(0); }
+}
