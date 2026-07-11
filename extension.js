@@ -152,18 +152,23 @@ function cssFromObj(obj) {
     return Object.entries(obj).map(([sel, rule]) => `${sel} {\n    ${rule}\n}`).join('\n');
 }
 
+// 仅代码区专属透明度(独立于全窗口的 background.opacity;范围 0.05~0.6,默认 0.22)
+function getCodeOpacity() {
+    const v = vscode.workspace.getConfiguration().get('beautify.codeOpacity');
+    return (typeof v === 'number' && v >= 0.05 && v <= 0.8) ? v : 0.22;
+}
+
 // 生成并写入 cus-dynamic.css;用注释标记当前 animMode / bgMode 供 readState 读取
 function writeDynamicCss(animMode, bgMode) {
     const bgUrl = getChosenImage();
-    const op = vscode.workspace.getConfiguration().get('custom-ui-style.background.opacity') || 0.92;
     let out = `/* 由美化控制台动态生成,勿手改 */\n/* ANIM:${animMode} */\n/* BG:${bgMode} */\n\n`;
     // 动画段
     const anim = ANIM_PRESETS[animMode] || {};
     if (Object.keys(anim).length) out += '/* ---- 动画 ---- */\n' + cssFromObj(anim) + '\n\n';
-    // 仅代码区背景段(图转 base64 绕过 CSP)
+    // 仅代码区背景段(图转 base64 绕过 CSP;用专属的 codeOpacity)
     if (bgMode === 'codeOnly' && bgUrl) {
         const dataUri = imageToDataUri(bgUrl);
-        out += '/* ---- 仅代码区背景 ---- */\n' + cssFromObj(codeOnlyCss(dataUri, op)) + '\n';
+        out += '/* ---- 仅代码区背景 ---- */\n' + cssFromObj(codeOnlyCss(dataUri, getCodeOpacity())) + '\n';
     }
     try { fs.writeFileSync(CUS_DYNAMIC_CSS, out); return true; } catch (e) { return false; }
 }
@@ -282,7 +287,9 @@ function readState() {
         animMode,
         bgMode,
         bgUrl,
-        bgOpacity: c.get('custom-ui-style.background.opacity'),
+        // 按模式返回对应透明度:全窗口用 background.opacity(0.7~1),仅代码区用 codeOpacity(0.05~0.6)
+        bgOpacity: bgMode === 'codeOnly' ? getCodeOpacity() : (c.get('custom-ui-style.background.opacity') || 0.92),
+        codeMode: bgMode === 'codeOnly',
         radius: getRadius(),
         colorTheme: c.get('workbench.colorTheme'),
         iconTheme: c.get('workbench.iconTheme'),
@@ -293,43 +300,23 @@ function readState() {
     };
 }
 
-// 自举:新机器上首次激活,自动创建所需 CSS 文件并登记到 Custom UI Style 的 imports
-const CUS_BASE_TEMPLATE = `/* 美化控制台基础样式:圆角 + 动画关键帧 */
-:root { --r: 8px; }
-.title-label > h2 { font-weight: 600; }
-.monaco-workbench .part.editor > .content .editor-group-container > .title div.tabs-container > .tab { border-radius: var(--r) var(--r) 0 0; margin: 2px 1px 0 1px; }
-.quick-input-widget { border-radius: calc(var(--r) + 2px); overflow: hidden; }
-.monaco-list-row { border-radius: calc(var(--r) - 2px); }
-.suggest-widget { border-radius: calc(var(--r) + 2px); overflow: hidden; }
-.monaco-hover { border-radius: var(--r); }
-.monaco-button { border-radius: calc(var(--r) - 2px); }
-.monaco-inputbox { border-radius: calc(var(--r) - 2px); }
-.monaco-workbench .notifications-toasts .notification-toast { border-radius: calc(var(--r) + 2px); overflow: hidden; }
-.monaco-workbench .activitybar .action-item { border-radius: var(--r); }
-.monaco-scrollable-element > .scrollbar > .slider { border-radius: calc(var(--r) - 2px); }
-@keyframes apc-fade-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
-@keyframes apc-fade-scale { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
-@keyframes apc-slide-in-left { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }
-@keyframes apc-bounce-in { 0% { opacity: 0; transform: scale(0.9) translateY(-8px); } 60% { opacity: 1; transform: scale(1.02) translateY(2px); } 100% { opacity: 1; transform: scale(1) translateY(0); } }
-@keyframes apc-zoom-in { from { opacity: 0; transform: scale(0.92); } to { opacity: 1; transform: scale(1); } }
-@keyframes apc-flip-in { from { opacity: 0; transform: perspective(400px) rotateX(-12deg); } to { opacity: 1; transform: perspective(400px) rotateX(0); } }
-`;
-
+// 自举:新机器首次激活,创建 CSS 文件并登记进 Custom UI Style 的 imports
 async function bootstrap() {
     try {
-        // 1) 确保 cus-base.css 存在
-        if (!fs.existsSync(CUS_BASE_CSS)) fs.writeFileSync(CUS_BASE_CSS, CUS_BASE_TEMPLATE);
-        // 2) 确保 cus-dynamic.css 存在
+        const baseTpl = ':root { --r: 8px; }\n' +
+            '@keyframes apc-fade-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }\n' +
+            '@keyframes apc-fade-scale { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }\n' +
+            '@keyframes apc-slide-in-left { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }\n' +
+            '@keyframes apc-bounce-in { 0% { opacity: 0; transform: scale(0.9) translateY(-8px); } 60% { opacity: 1; transform: scale(1.02) translateY(2px); } 100% { opacity: 1; transform: scale(1) translateY(0); } }\n' +
+            '@keyframes apc-zoom-in { from { opacity: 0; transform: scale(0.92); } to { opacity: 1; transform: scale(1); } }\n' +
+            '@keyframes apc-flip-in { from { opacity: 0; transform: perspective(400px) rotateX(-12deg); } to { opacity: 1; transform: perspective(400px) rotateX(0); } }\n';
+        if (!fs.existsSync(CUS_BASE_CSS)) fs.writeFileSync(CUS_BASE_CSS, baseTpl);
         if (!fs.existsSync(CUS_DYNAMIC_CSS) || fs.readFileSync(CUS_DYNAMIC_CSS, 'utf8').trim().length < 20) {
             writeDynamicCss('default', 'off');
         }
-        // 3) 确保两文件登记进 Custom UI Style 的 external.imports
         const cfg = vscode.workspace.getConfiguration();
         const imports = cfg.get('custom-ui-style.external.imports') || [];
-        const need = [
-            'file://' + CUS_BASE_CSS.replace(/\\/g, '/'),
-            'file://' + CUS_DYNAMIC_CSS.replace(/\\/g, '/')
-        ];
+        const need = ['file://' + CUS_BASE_CSS.replace(/\\/g, '/'), 'file://' + CUS_DYNAMIC_CSS.replace(/\\/g, '/')];
         let changed = false;
         for (const im of need) if (!imports.includes(im)) { imports.push(im); changed = true; }
         if (changed) {
@@ -366,7 +353,6 @@ function activate(context) {
     );
 }
 
-// 默认无内置背景图,用户通过面板「选择图片」自行设置(可移植,不绑定特定机器)
 const DEFAULT_BG = '';
 // 「选了哪张图」独立持久化,与「用哪个模式」完全分开(修复选图跳全窗口的 bug)
 const CHOSEN_IMG_FILE = path.join(USER_DIR, '.beautify-bg-image');
@@ -449,12 +435,18 @@ async function handleMessage(msg, panel) {
             markRestart(panel);
         } else if (msg.type === 'setBg') {
             await applyBg(msg.value, true);
+            panel.webview.postMessage({ type: 'init', state: readState() });  // 刷新滑块范围
             markRestart(panel);
         } else if (msg.type === 'setBgOpacity') {
-            await setConfig([['custom-ui-style.background.opacity', msg.value]]);
-            // codeOnly 模式下 opacity 在 dynamic css 里,需重写
             const st = readState();
-            if (st.bgMode === 'codeOnly') writeDynamicCss(st.animMode, 'codeOnly');
+            if (st.bgMode === 'codeOnly') {
+                // 仅代码区:写专属 codeOpacity,重写 dynamic css
+                await setConfig([['beautify.codeOpacity', msg.value]]);
+                writeDynamicCss(st.animMode, 'codeOnly');
+            } else {
+                // 全窗口:写 CUS 内建 background.opacity
+                await setConfig([['custom-ui-style.background.opacity', msg.value]]);
+            }
             markRestart(panel);
         } else if (msg.type === 'pickImage') {
             const uri = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { 图片: ['png', 'jpg', 'jpeg', 'webp'] } });
@@ -692,7 +684,7 @@ input[type=range]:active::-webkit-slider-thumb { transform: scale(1.25); }
 </head>
 <body>
 <div class="header">
-    <h1>🎨 美化控制台 <span style="font-size:11px;color:var(--muted);font-weight:400">v13</span></h1>
+    <h1>🎨 美化控制台 <span style="font-size:11px;color:var(--muted);font-weight:400">v14</span></h1>
     <div class="actions">
         <button class="ghost" id="btnRestore">恢复默认</button>
         <button class="ghost" id="btnRefresh">刷新</button>
@@ -824,7 +816,13 @@ function render(){
     $('paddingTop').value = S.paddingTop || 10; $('paddingTopV').textContent = (S.paddingTop||10);
     setSeg('animSeg', S.animMode || 'off');
     setSeg('bgSeg', S.bgMode || 'off');
-    $('bgOpacity').value = S.bgOpacity || 0.92; $('bgOpacityV').textContent = (S.bgOpacity||0.92);
+    // 不透明度滑块:按模式切换范围(仅代码区 0.05~0.6 更淡,全窗口 0.7~1)
+    const opEl = $('bgOpacity');
+    if (S.codeMode) { opEl.min = '0.05'; opEl.max = '0.6'; opEl.step = '0.01'; }
+    else { opEl.min = '0.7'; opEl.max = '1'; opEl.step = '0.01'; }
+    const defOp = S.codeMode ? 0.22 : 0.92;
+    opEl.value = (typeof S.bgOpacity === 'number' ? S.bgOpacity : defOp);
+    $('bgOpacityV').textContent = opEl.value;
     fillSelect($('colorTheme'), S.themes, S.colorTheme);
     fillSelect($('iconTheme'), S.iconThemes, S.iconTheme);
     fillSelect($('productIconTheme'), S.productThemes, S.productIconTheme);
