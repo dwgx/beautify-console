@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.2] - 2026-07-12
+
+### 修复
+- 注册 beautify.codeOpacity 配置项,修复仅代码区调透明度报错 "not a registered configuration"
+
 ## [1.0.1] - 2026-07-12
 
 ### 修复

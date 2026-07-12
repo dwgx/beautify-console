@@ -2,7 +2,7 @@
     "name": "beautify-console",
     "displayName": "美化控制台 Beautify Console",
     "description": "VS Code 一站式可视化美化面板:字体/布局/编辑器/动画/多区域背景图/圆角/主题,支持轮播、自定义 CSS、配置导入导出。A visual beautify panel for VS Code.",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "publisher": "dwgx",
     "license": "MIT",
     "engines": {
@@ -48,6 +48,18 @@
                 "command": "bgSwitcher.off",
                 "title": "美化: 背景-关闭"
             }
-        ]
+        ],
+        "configuration": {
+            "title": "美化控制台",
+            "properties": {
+                "beautify.codeOpacity": {
+                    "type": "number",
+                    "default": 0.22,
+                    "minimum": 0.05,
+                    "maximum": 0.8,
+                    "description": "仅代码区背景图的不透明度(独立于全窗口)"
+                }
+            }
+        }
     }
 }
