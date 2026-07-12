@@ -300,7 +300,11 @@ function readState() {
     };
 }
 
+// 首次激活标记文件
+const INIT_DONE_FILE = path.join(USER_DIR, '.beautify-init-done');
+
 // 自举:新机器首次激活,创建 CSS 文件并登记进 Custom UI Style 的 imports
+// 首次安装时自动应用 JetBrains 默认参数
 async function bootstrap() {
     try {
         const baseTpl = ':root { --r: 8px; }\n' +
@@ -324,7 +328,44 @@ async function bootstrap() {
             await cfg.update('custom-ui-style.external.loadStrategy', 'refetch', vscode.ConfigurationTarget.Global);
             await cfg.update('custom-ui-style.reloadWithoutPrompting', true, vscode.ConfigurationTarget.Global);
         }
+        // 首次安装:自动应用 JetBrains 默认参数
+        if (!fs.existsSync(INIT_DONE_FILE)) {
+            await applyJetBrainsDefaults();
+            fs.writeFileSync(INIT_DONE_FILE, new Date().toISOString());
+        }
     } catch (e) {}
+}
+
+// 首次安装时自动应用的 JetBrains 默认参数(与 restoreDefaults 一致但不弹通知、不 reload)
+async function applyJetBrainsDefaults() {
+    await setConfig([
+        ['editor.fontFamily', "'JetBrains Mono', Consolas, 'Courier New', monospace"],
+        ['editor.fontSize', 14],
+        ['editor.lineHeight', 1.6],
+        ['editor.fontWeight', '400'],
+        ['editor.fontLigatures', true],
+        ['workbench.statusBar.visible', true],
+        ['breadcrumbs.enabled', true],
+        ['workbench.activityBar.location', 'top'],
+        ['window.menuBarVisibility', 'compact'],
+        ['workbench.editor.tabSizing', 'shrink'],
+        ['editor.cursorSmoothCaretAnimation', 'on'],
+        ['editor.smoothScrolling', true],
+        ['editor.bracketPairColorization.enabled', true],
+        ['editor.guides.indentation', true],
+        ['editor.stickyScroll.enabled', true],
+        ['editor.minimap.enabled', true],
+        ['editor.padding.top', 10],
+        ['editor.padding.bottom', 10],
+        ['workbench.colorTheme', 'Int UI Dark'],
+        ['workbench.iconTheme', 'int-ui-icons-dark'],
+        ['workbench.productIconTheme', 'jetbrains-product-icon-theme'],
+        ['terminal.integrated.fontFamily', "'JetBrains Mono', monospace"]
+    ]);
+    setRadius(8);
+    await setConfig([['custom-ui-style.background.opacity', 0.92]]);
+    writeDynamicCss('default', 'off');
+    await reloadCUS();
 }
 
 function activate(context) {
