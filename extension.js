@@ -50,6 +50,9 @@ function getUserDir() {
 // 本插件管理的两个 CSS 文件(路径随 userDir 动态解析,不能提前算成常量)
 const cusBaseCss = () => path.join(getUserDir(), 'cus-base.css');
 const cusDynamicCss = () => path.join(getUserDir(), 'cus-dynamic.css');
+// 用户手写的 CSS。本插件只创建、绝不覆盖 —— 它必须与生成的文件分开,
+// 因为 writeDynamicCss() 是整文件重写,放一起会被清掉。
+const cusCustomCss = () => path.join(getUserDir(), 'cus-custom.css');
 
 // 绝对路径 → file:// URL。pathToFileURL 会正确处理盘符与空格转义,
 // 且能被 Custom UI Style 内部的 fileURLToPath 原样还原。
@@ -577,7 +580,7 @@ function readState() {
 const initDoneFile = () => path.join(getUserDir(), '.beautify-init-done');
 
 // 本插件在 imports 里管理的文件名 —— 用于剔除其它机器同步过来的旧条目
-const MANAGED_CSS_NAMES = ['cus-base.css', 'cus-dynamic.css'];
+const MANAGED_CSS_NAMES = ['cus-base.css', 'cus-dynamic.css', 'cus-custom.css'];
 
 // settings.json 会被 Settings Sync 同步,于是 Windows 上写的
 // `file://C:/Users/xxx/AppData/...` 会跟到 macOS/Linux。这些路径在本机
@@ -612,7 +615,17 @@ async function bootstrap() {
         }
         const cfg = vscode.workspace.getConfiguration();
         const imports = cfg.get('custom-ui-style.external.imports') || [];
-        const need = [toFileUrl(cusBaseCss()), toFileUrl(cusDynamicCss())];
+        // 必须先落盘再登记:缺文件不会被静默跳过 —— Custom UI Style 读取失败会
+        // 弹错误通知并强制打开输出面板(external.ts:141 → utils.ts:160),每次
+        // reload 都来一遍。
+        if (!fs.existsSync(cusCustomCss())) {
+            fs.writeFileSync(cusCustomCss(),
+                '/* 自定义 CSS —— 美化控制台不会覆盖此文件。\n' +
+                '   改动后需运行 "Custom UI Style: Reload"(macOS 会整个退出重开)。*/\n');
+        }
+        // cus-custom.css 放最后:external.imports 按数组顺序合并,靠后者在同
+        // 优先级下胜出,用户手写规则才能压过我们生成的。
+        const need = [toFileUrl(cusBaseCss()), toFileUrl(cusDynamicCss()), toFileUrl(cusCustomCss())];
         const kept = imports.filter(im => !isStaleManagedImport(im, need));
         let changed = kept.length !== imports.length;
         for (const im of need) if (!kept.includes(im)) { kept.push(im); changed = true; }
@@ -867,7 +880,7 @@ module.exports = {
     setConfig, applicable, platformSkipKeys, warnFailed,
     // 多区域背景 / 轮播
     REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
-    imageCssUrl, carouselKeyframes, regionCss
+    imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss
 };
 
 function getHtml() {

@@ -176,6 +176,61 @@ test('setConfig 单键写入失败不中断整批(未注册键不再吃掉后续
     }
 });
 
+test('自定义 CSS 不被生成流程覆盖(第三个文件存在的理由)', () => {
+    const fs = require('node:fs');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-iso-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        const mine = '/* 我手写的,不许动 */\n.monaco-workbench { outline: 1px solid red; }\n';
+        fs.writeFileSync(path.join(userDir, 'cus-custom.css'), mine);
+        // writeDynamicCss 是整文件重写 —— 必须只碰 cus-dynamic.css
+        ext.writeDynamicCss('fancy', 'off');
+        assert.strictEqual(fs.readFileSync(path.join(userDir, 'cus-custom.css'), 'utf8'), mine);
+        assert.match(fs.readFileSync(path.join(userDir, 'cus-dynamic.css'), 'utf8'), /ANIM:fancy/);
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('regionCss 换图帧的 opacity 必须为 0(否则轮播会硬切)', () => {
+    const css = ext.regionCss('editor', { images: ['/a.png', '/b.png', '/c.png'], opacity: 0.22, intervalMs: 6000 });
+    const frames = [...css.matchAll(/([\d.]+)% \{ background-image: url\("([^"]+)"\); opacity: ([\d.]+); \}/g)]
+        .map(m => ({ pct: +m[1], img: m[2], op: +m[3] }));
+    assert.ok(frames.length >= 10, `应有 3*3+1 帧,实际 ${frames.length}`);
+    // 逐帧比对:图一换,该帧 opacity 必须是 0
+    for (let i = 1; i < frames.length; i++) {
+        if (frames[i].img !== frames[i - 1].img) {
+            assert.strictEqual(frames[i].op, 0,
+                `${frames[i].pct}% 处换图但 opacity=${frames[i].op},会看到硬切`);
+        }
+    }
+    // opacity 不得超过该区域配置值,否则轮播时比静态时浓
+    assert.strictEqual(Math.max(...frames.map(f => f.op)), 0.22);
+    assert.match(css, /prefers-reduced-motion/);
+});
+
+test('regionCss 单图不生成动画,多图才生成', () => {
+    const one = ext.regionCss('panel', { images: ['/a.png'], opacity: 0.18 });
+    assert.ok(!/@keyframes/.test(one), '单图不应有 keyframes');
+    assert.match(one, /background-image: url\("vscode-file:\/\/vscode-app\/a\.png"\)/);
+    const many = ext.regionCss('panel', { images: ['/a.png', '/b.png'], opacity: 0.18 });
+    assert.match(many, /@keyframes beautify-carousel-panel/);
+    // 透明化必须带 !important —— part 背景是内联 style 写的
+    for (const sel of ext.REGIONS.panel.transparent) {
+        assert.ok(many.includes(`${sel} { background-color: transparent !important; }`), `缺 ${sel} 的透明化`);
+    }
+});
+
+test('imageCssUrl 白名单外的扩展名退回 base64 内联', () => {
+    assert.match(ext.imageCssUrl('/x/a.png'), /^vscode-file:\/\/vscode-app\//);
+    // .tiff 不在 Electron 的 validExtensions 里,vscode-file 会被拒
+    assert.ok(!ext.imageCssUrl('/x/a.tiff').startsWith('vscode-file:'), 'tiff 不该走 vscode-file');
+    // 强制内联开关
+    assert.ok(!ext.imageCssUrl('/x/a.png', true).startsWith('vscode-file:'), 'inline=true 应走 base64 路径');
+});
+
 // —— 端到端:这条直接复现原 bug(文件写到不存在的 Windows 目录 → 静默失效) ——
 test('激活后在解析出的 User 目录下自举,并清理跨平台残留 import', async () => {
     const fs = require('node:fs');
@@ -210,9 +265,18 @@ test('激活后在解析出的 User 目录下自举,并清理跨平台残留 imp
         const imports = vscodeStub.__store.get('custom-ui-style.external.imports');
         assert.ok(!imports.some(i => i.includes('C:/')), '残留的 Windows 条目应被剔除');
         assert.ok(imports.includes(mine), '用户自加的 import 必须保留');
-        assert.ok(imports.includes(ext.toFileUrl(path.join(userDir, 'cus-base.css'))));
-        assert.ok(imports.includes(ext.toFileUrl(path.join(userDir, 'cus-dynamic.css'))));
-        assert.strictEqual(imports.length, 3);
+        const base = ext.toFileUrl(path.join(userDir, 'cus-base.css'));
+        const dyn = ext.toFileUrl(path.join(userDir, 'cus-dynamic.css'));
+        const custom = ext.toFileUrl(path.join(userDir, 'cus-custom.css'));
+        assert.ok(imports.includes(base));
+        assert.ok(imports.includes(dyn));
+        assert.ok(imports.includes(custom), '自定义 CSS 也要登记');
+        assert.strictEqual(imports.length, 4);
+        // 顺序决定优先级:cus-custom.css 必须在生成的两个之后,用户规则才压得过
+        assert.ok(imports.indexOf(custom) > imports.indexOf(base), 'custom 必须晚于 base');
+        assert.ok(imports.indexOf(custom) > imports.indexOf(dyn), 'custom 必须晚于 dynamic');
+        // 缺文件会让 CUS 每次 reload 弹错误通知,所以登记前必须已落盘
+        assert.ok(fs.existsSync(path.join(userDir, 'cus-custom.css')), '自定义 CSS 文件应已创建');
 
         // 面板能渲染出来,且带上平台信息
         await vscodeStub.__commands.get('beautify.openPanel')();
