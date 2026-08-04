@@ -278,6 +278,24 @@ test('sanitizeState 对垃圾输入不抛异常', () => {
     }
 });
 
+test('safeImageName 清洗掉能破坏 CSS 规则的字符', () => {
+    // 全窗口模式把路径交给 Custom UI Style,它用 url('...') 单引号拼接且不转义,
+    // 而 pathToFileURL 不转义单引号 —— 名字带 ') 的图会提前闭合这条规则。
+    const cleaned = ext.safeImageName("foo')}body{display:none}.png");
+    for (const ch of ['\'', '"', '(', ')', '{', '}', ';']) {
+        assert.ok(!cleaned.includes(ch), `${ch} 应被清掉,实际 ${cleaned}`);
+    }
+    // 路径分量被剥掉,不能借文件名跳出 backgrounds/
+    assert.strictEqual(ext.safeImageName('../../etc/passwd.png'), 'passwd.png');
+    assert.ok(!ext.safeImageName('../../x.png').includes('..'));
+    // 扩展名必须留住,否则 vscode-file 白名单命中不了,白白退回 base64
+    for (const name of ['normal.png', '.png', 'no-ext', '...hidden.png', 'a"b.jpg']) {
+        assert.ok(ext.canUseWorkbenchUrl(ext.safeImageName(name)), `${name} 清洗后应仍可走 vscode-file`);
+    }
+    assert.strictEqual(ext.safeImageName('normal.png'), 'normal.png', '正常名字不该被改');
+    assert.ok(ext.safeImageName('x'.repeat(200) + '.webp').length < 100, '过长名字应截断');
+});
+
 test('imageCssUrl 白名单外的扩展名退回 base64 内联', () => {
     assert.match(ext.imageCssUrl('/x/a.png'), /^vscode-file:\/\/vscode-app\//);
     // .tiff 不在 Electron 的 validExtensions 里,vscode-file 会被拒

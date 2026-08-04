@@ -204,6 +204,22 @@ function canUseWorkbenchUrl(absPath) {
     return VSCODE_FILE_EXTS.includes(path.extname(String(absPath)).toLowerCase());
 }
 
+// 复制进 backgrounds/ 时清洗文件名。
+// 全窗口模式把路径交给 Custom UI Style,它按 `url('...')` 单引号拼接且不转义
+// (css.ts:31),而 pathToFileURL 不转义单引号 —— 于是名字里带 `')` 的图片会
+// 提前闭合这条规则,背景静默失效。本插件自己生成的 CSS 用双引号 + encodeURI
+// (双引号会被转成 %22)不受影响,但源头清洗掉最省事,两条路径一起保住。
+function safeImageName(name) {
+    // 先剥掉开头的点,否则 ".png" 会被 extname 当成无扩展名的隐藏文件,
+    // 清洗后变成 "_png" —— 扩展名没了,vscode-file 白名单也就命中不了。
+    const bare = String(name).replace(/^\.+/, '');
+    const ext = path.extname(bare).toLowerCase();
+    const stem = path.basename(bare, path.extname(bare))
+        .replace(/['"(){};\\\r\n]/g, '_')   // CSS url() / 规则语法里有特殊含义的字符
+        .slice(0, 80);
+    return (stem || 'image') + (ext || '.png');
+}
+
 // 单张图 → CSS url() 值。inline 为真时强制内联 base64(兜底开关)
 function imageCssUrl(absPath, inline) {
     if (!absPath) return '';
@@ -1036,7 +1052,7 @@ async function handleMessage(msg, panel) {
             const uri = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { 图片: ['png', 'jpg', 'jpeg', 'webp'] } });
             if (uri && uri[0]) {
                 const p = uri[0].fsPath;
-                const dest = path.join(getUserDir(), 'backgrounds', path.basename(p));
+                const dest = path.join(getUserDir(), 'backgrounds', safeImageName(path.basename(p)));
                 fs.mkdirSync(path.dirname(dest), { recursive: true });
                 fs.copyFileSync(p, dest);
                 const url = toFileUrl(dest);
@@ -1113,7 +1129,7 @@ module.exports = {
     setConfig, applicable, platformSkipKeys, warnFailed,
     // 多区域背景 / 轮播
     REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
-    imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss,
+    imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss, safeImageName,
     // 状态
     STATE_VERSION, stateFile, defaultState, sanitizeState, readBeautifyState, writeBeautifyState,
     migrateLegacyState, ANIM_MODES, BG_MODES,
