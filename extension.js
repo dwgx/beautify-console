@@ -178,6 +178,16 @@ async function setConfig(updates) {
     return failed;
 }
 
+// 用户在面板里主动改的设置若写入失败,必须让他看见 ——
+// 否则面板照样弹「已实时应用」,而设置根本没生效。
+function warnFailed(failed) {
+    if (failed && failed.length) {
+        vscode.window.showWarningMessage(
+            `美化控制台: 以下设置写入失败(当前 VS Code 未注册该项): ${failed.join(', ')}`);
+    }
+    return failed;
+}
+
 // 合并 stylesheet: 应用动画档 + 代码区背景(互不干扰)
 function buildStylesheet(current, animMode, bgMode, bgUrl) {
     let base = {};
@@ -440,8 +450,11 @@ const MANAGED_CSS_NAMES = ['cus-base.css', 'cus-dynamic.css'];
 function isStaleManagedImport(entry, keep) {
     if (typeof entry !== 'string' || !entry.startsWith('file://')) return false;
     if (keep.includes(entry)) return false;
-    const name = path.basename(fromFileUrl(entry));
-    return MANAGED_CSS_NAMES.includes(name);
+    const p = fromFileUrl(entry);
+    // 必须落在某个 User 目录下,才认定是本插件在别的机器上写的。
+    // 只按文件名判断会误删用户自己放在别处的同名 CSS。
+    if (path.basename(path.dirname(p)) !== 'User') return false;
+    return MANAGED_CSS_NAMES.includes(path.basename(p));
 }
 
 // 自举:新机器首次激活,创建 CSS 文件并登记进 Custom UI Style 的 imports
@@ -558,14 +571,14 @@ async function applyBg(mode, noReload) {
     const animMode = readDynamicModes().animMode;
     if (mode === 'full') {
         // 全窗口:CUS 内建背景显示;dynamic css 只留动画(bg=off)
-        await setConfig([['custom-ui-style.background.url', bgUrl]]);
+        warnFailed(await setConfig([['custom-ui-style.background.url', bgUrl]]));
         writeDynamicCss(animMode, 'off');
     } else if (mode === 'codeOnly') {
         // 仅代码区:清 url,把背景 CSS 写进 dynamic css
-        await setConfig([['custom-ui-style.background.url', '']]);
+        warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
         writeDynamicCss(animMode, 'codeOnly');
     } else {
-        await setConfig([['custom-ui-style.background.url', '']]);
+        warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
         writeDynamicCss(animMode, 'off');
     }
     if (!noReload) await reloadCUS();
@@ -607,14 +620,14 @@ async function handleMessage(msg, panel) {
         if (msg.type === 'setFont') {
             // 选字体名 → 组装带平台兜底链的 fontFamily(编辑器+终端一起)
             const ff = fontStack(msg.value);
-            await setConfig([
+            warnFailed(await setConfig([
                 ['editor.fontFamily', ff],
                 ['terminal.integrated.fontFamily', ff]
-            ]);
+            ]));
         } else if (msg.type === 'setNative') {
             const key = NATIVE_MAP[msg.key];
-            if (key) { await setConfig([[key, msg.value]]); }
-            if (msg.key === 'paddingTop') await setConfig([['editor.padding.top', msg.value], ['editor.padding.bottom', msg.value]]);
+            if (key) { warnFailed(await setConfig([[key, msg.value]])); }
+            if (msg.key === 'paddingTop') warnFailed(await setConfig([['editor.padding.top', msg.value], ['editor.padding.bottom', msg.value]]));
             // 原生参数即时生效,无需重启
         } else if (msg.type === 'setAnim') {
             // 动画写进 cus-dynamic.css(保持当前背景模式)
@@ -629,11 +642,11 @@ async function handleMessage(msg, panel) {
             const st = readState();
             if (st.bgMode === 'codeOnly') {
                 // 仅代码区:写专属 codeOpacity,重写 dynamic css
-                await setConfig([['beautify.codeOpacity', msg.value]]);
+                warnFailed(await setConfig([['beautify.codeOpacity', msg.value]]));
                 writeDynamicCss(st.animMode, 'codeOnly');
             } else {
                 // 全窗口:写 CUS 内建 background.opacity
-                await setConfig([['custom-ui-style.background.opacity', msg.value]]);
+                warnFailed(await setConfig([['custom-ui-style.background.opacity', msg.value]]));
             }
             markRestart(panel);
         } else if (msg.type === 'pickImage') {
@@ -670,7 +683,7 @@ async function handleMessage(msg, panel) {
 
 // 恢复默认 —— 复位到我们这套 JetBrains 配置(固定快照)
 async function restoreDefaults(panel) {
-    await setConfig([
+    const failed = await setConfig([
         ['editor.fontFamily', fontStack('JetBrains Mono')],
         ['editor.fontSize', 14],
         ['editor.lineHeight', 1.6],
@@ -694,15 +707,17 @@ async function restoreDefaults(panel) {
         ['workbench.productIconTheme', 'jetbrains-product-icon-theme']
     ]);
     // 圆角复位、不透明度复位
-    await setConfig([['custom-ui-style.background.opacity', 0.92]]);
+    failed.push(...await setConfig([['custom-ui-style.background.opacity', 0.92]]));
     setRadius(8);
     // 恢复默认 = 干净 JetBrains 外观:动画回 default 档,背景图关闭
-    await setConfig([['custom-ui-style.background.url', '']]);
-    await setConfig([['custom-ui-style.stylesheet', {}]]);  // 清空失效的旧设置残留
+    failed.push(...await setConfig([['custom-ui-style.background.url', '']]));
+    failed.push(...await setConfig([['custom-ui-style.stylesheet', {}]]));  // 清空失效的旧设置残留
     writeDynamicCss('default', 'off');
     pendingRestart = false;
     await reloadCUS();
-    vscode.window.showInformationMessage('已恢复默认 JetBrains 外观(已移除背景图)。');
+    // 有键没写进去就别报「已恢复默认」
+    if (failed.length) warnFailed(failed);
+    else vscode.window.showInformationMessage('已恢复默认 JetBrains 外观(已移除背景图)。');
 }
 
 function deactivate() {}
@@ -712,7 +727,7 @@ module.exports = {
     defaultUserDir, resolveUserDir, getUserDir, cusBaseCss, cusDynamicCss,
     toFileUrl, fromFileUrl, isStaleManagedImport, MANAGED_CSS_NAMES,
     fontDirs, fallbackFonts, fontStack, listFonts, currentFontName,
-    setConfig, applicable, platformSkipKeys
+    setConfig, applicable, platformSkipKeys, warnFailed
 };
 
 function getHtml() {

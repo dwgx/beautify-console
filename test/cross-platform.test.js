@@ -85,6 +85,27 @@ test('isStaleManagedImport 剔除其它机器同步来的托管 CSS,保留用户
     assert.strictEqual(ext.isStaleManagedImport({ type: 'css', url: 'https://example.com/a.css' }, keep), false);
 });
 
+test('isStaleManagedImport 不误删用户放在 User 目录之外的同名 CSS', () => {
+    const keep = [ext.toFileUrl('/Users/me/Library/Application Support/Code/User/cus-base.css')];
+    // 同名但不在 User 目录下 —— 是用户自己的文件,必须保留
+    assert.strictEqual(ext.isStaleManagedImport('file:///Users/me/my-theme/cus-base.css', keep), false);
+    assert.strictEqual(ext.isStaleManagedImport('file:///opt/shared/cus-dynamic.css', keep), false);
+    // 在别的机器的 User 目录下 —— 剔除
+    assert.strictEqual(ext.isStaleManagedImport('file://C:/Users/other/AppData/Roaming/Code/User/cus-base.css', keep), true);
+});
+
+test('warnFailed 有失败键才提示,没有则保持安静', () => {
+    const vscodeStub = require('./vscode-stub.js');
+    vscodeStub.window.warnings.length = 0;
+    ext.warnFailed([]);
+    ext.warnFailed(undefined);
+    assert.deepStrictEqual(vscodeStub.window.warnings, [], '无失败键时不应打扰用户');
+    ext.warnFailed(['window.menuBarVisibility']);
+    assert.strictEqual(vscodeStub.window.warnings.length, 1);
+    assert.match(vscodeStub.window.warnings[0], /window\.menuBarVisibility/);
+    vscodeStub.window.warnings.length = 0;
+});
+
 test('fallbackFonts 只用当前平台真实存在的字体', () => {
     onPlatform('darwin', () => {
         const f = ext.fallbackFonts();

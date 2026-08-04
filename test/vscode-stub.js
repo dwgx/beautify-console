@@ -31,7 +31,7 @@ module.exports = {
     __commands: new Map(),
     window: {
         showErrorMessage: (...a) => { module.exports.window.errors.push(a[0]); },
-        showWarningMessage: () => {},
+        showWarningMessage: (...a) => { module.exports.window.warnings.push(a[0]); },
         showInformationMessage: async () => undefined,
         showOpenDialog: async () => undefined,
         createWebviewPanel: () => {
@@ -49,6 +49,7 @@ module.exports = {
             return panel;
         },
         errors: [],
+        warnings: [],
         panels: []
     },
     workspace: {
