@@ -515,6 +515,126 @@ function readBeautifyState() {
     }
 }
 
+// ============================================================
+// 配置导出 / 导入
+// 配置散在三处:VS Code 设置键、cus-base.css 的 --r、状态文件。
+// 导出把三者收进一个 JSON;导入时全部走 sanitize,不采信任何字段。
+// 图片按绝对路径引用而非内嵌 —— 内嵌会让文件大到无法分享(12 张 2MB 图 = 33MB),
+// 且人也没法手改。导入时逐个检查存在性,缺图明确报出来。
+// ============================================================
+const EXPORT_KIND = 'beautify-console-config';
+
+// 导出会带上的 VS Code 设置键 → 允许的值类型。
+// 类型必须写死,不能拿 cfg.get() 的当前值去比 —— 键在本机没设过时当前值是
+// undefined,那样校验会被整个跳过,字符串就能写进 number 型的键里。
+// 少数键 VS Code 本身接受多种类型(如 fontLigatures 可为 bool 或字符串),写成数组。
+const EXPORTED_SETTINGS_TYPES = {
+    'editor.fontFamily': 'string',
+    'editor.fontSize': 'number',
+    'editor.lineHeight': 'number',
+    'editor.fontWeight': ['string', 'number'],
+    'editor.fontLigatures': ['boolean', 'string'],
+    'workbench.statusBar.visible': 'boolean',
+    'breadcrumbs.enabled': 'boolean',
+    'workbench.activityBar.location': 'string',
+    'window.menuBarVisibility': 'string',
+    'workbench.editor.tabSizing': 'string',
+    'editor.cursorSmoothCaretAnimation': ['string', 'boolean'],
+    'editor.smoothScrolling': 'boolean',
+    'editor.bracketPairColorization.enabled': 'boolean',
+    'editor.guides.indentation': 'boolean',
+    'editor.stickyScroll.enabled': 'boolean',
+    'editor.minimap.enabled': 'boolean',
+    'editor.padding.top': 'number',
+    'editor.padding.bottom': 'number',
+    'workbench.colorTheme': 'string',
+    'workbench.iconTheme': 'string',
+    'workbench.productIconTheme': 'string',
+    'terminal.integrated.fontFamily': 'string',
+    'custom-ui-style.background.opacity': 'number',
+    'beautify.codeOpacity': 'number'
+};
+const EXPORTED_SETTINGS = Object.keys(EXPORTED_SETTINGS_TYPES);
+
+function settingTypeOk(key, value) {
+    const want = EXPORTED_SETTINGS_TYPES[key];
+    if (!want) return false;
+    const list = Array.isArray(want) ? want : [want];
+    if (!list.includes(typeof value)) return false;
+    // number 型不接受 NaN / Infinity —— 写进 CSS 会产出非法值
+    if (typeof value === 'number' && !Number.isFinite(value)) return false;
+    return true;
+}
+
+function exportConfig() {
+    const cfg = vscode.workspace.getConfiguration();
+    const settings = {};
+    for (const k of EXPORTED_SETTINGS) {
+        const v = cfg.get(k);
+        if (v !== undefined) settings[k] = v;
+    }
+    let customCss = '';
+    try { customCss = fs.readFileSync(cusCustomCss(), 'utf8'); } catch (e) { /* 没有就空 */ }
+    return {
+        kind: EXPORT_KIND,
+        version: STATE_VERSION,
+        exportedAt: new Date().toISOString(),
+        radius: getRadius(),
+        settings,
+        state: readBeautifyState(),
+        customCss
+    };
+}
+
+// 导入:校验 → 应用。返回 { applied, rejected, missingImages, failedKeys }
+async function importConfig(raw) {
+    if (!raw || typeof raw !== 'object') throw new Error('文件内容不是 JSON 对象');
+    if (raw.kind !== EXPORT_KIND) throw new Error(`不是美化控制台的配置文件(kind=${JSON.stringify(raw.kind)})`);
+
+    const { state, rejected } = sanitizeState(raw.state);
+    // 缺图不阻断导入 —— 别人机器上的路径在本机大概率不存在,但其余配置仍有价值
+    const missingImages = [];
+    for (const k of REGION_KEYS) {
+        state.regions[k].images = state.regions[k].images.filter(p => {
+            if (fs.existsSync(p)) return true;
+            missingImages.push(p);
+            return false;
+        });
+    }
+
+    // 设置键:只认白名单内的键,值类型必须与当前值一致(或当前无值)
+    const updates = [];
+    const rawSettings = (raw.settings && typeof raw.settings === 'object') ? raw.settings : {};
+    const cfg = vscode.workspace.getConfiguration();
+    for (const k of EXPORTED_SETTINGS) {
+        if (!(k in rawSettings)) continue;
+        const v = rawSettings[k];
+        if (!settingTypeOk(k, v)) { rejected.push(`${k}=${JSON.stringify(v)} 类型不符`); continue; }
+        updates.push([k, v]);
+    }
+    for (const k of Object.keys(rawSettings)) {
+        if (!EXPORTED_SETTINGS.includes(k)) rejected.push(`未知设置键 ${k}`);
+    }
+    const failedKeys = await setConfig(updates);
+
+    if (typeof raw.radius === 'number' && raw.radius >= 0 && raw.radius <= 40) setRadius(Math.round(raw.radius));
+    else if (raw.radius !== undefined) rejected.push(`radius=${JSON.stringify(raw.radius)}`);
+
+    // 自定义 CSS 属于用户资产,导入前先备份,别人的配置不该无声覆盖你写的
+    if (typeof raw.customCss === 'string') {
+        try {
+            if (fs.existsSync(cusCustomCss())) {
+                fs.copyFileSync(cusCustomCss(), cusCustomCss() + '.bak');
+            }
+            fs.writeFileSync(cusCustomCss(), raw.customCss);
+        } catch (e) { rejected.push(`自定义 CSS 写入失败: ${e.message}`); }
+    }
+
+    writeBeautifyState(state);
+    writeDynamicCss(state.animMode, state.bgMode, state);
+    return { applied: true, rejected, missingImages, failedKeys };
+}
+
 function writeBeautifyState(st) {
     try {
         fs.mkdirSync(getUserDir(), { recursive: true });
@@ -996,7 +1116,10 @@ module.exports = {
     imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss,
     // 状态
     STATE_VERSION, stateFile, defaultState, sanitizeState, readBeautifyState, writeBeautifyState,
-    migrateLegacyState, ANIM_MODES, BG_MODES
+    migrateLegacyState, ANIM_MODES, BG_MODES,
+    // 导出/导入
+    EXPORT_KIND, EXPORTED_SETTINGS, EXPORTED_SETTINGS_TYPES, settingTypeOk, exportConfig, importConfig,
+    getRadius, setRadius
 };
 
 function getHtml() {

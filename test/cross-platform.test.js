@@ -245,6 +245,31 @@ test('sanitizeState 丢弃一切非法输入(导入的配置文件不可信)', (
     assert.ok(rejected.length >= 6, `应记录被丢弃项,实际 ${rejected.length}`);
 });
 
+test('settingTypeOk 按声明的类型校验,不依赖当前值是否存在', () => {
+    // 这条锁住一个真实 bug:早先拿 cfg.get() 的当前值比类型,键没设过时
+    // 当前值是 undefined,校验被整个跳过,字符串就能写进 number 型的键。
+    assert.strictEqual(ext.settingTypeOk('editor.lineHeight', 'not-a-number'), false);
+    assert.strictEqual(ext.settingTypeOk('editor.lineHeight', 1.6), true);
+    assert.strictEqual(ext.settingTypeOk('editor.fontSize', '14'), false);
+    assert.strictEqual(ext.settingTypeOk('workbench.statusBar.visible', 'true'), false);
+    assert.strictEqual(ext.settingTypeOk('workbench.statusBar.visible', true), true);
+    // 多类型键
+    assert.strictEqual(ext.settingTypeOk('editor.fontLigatures', true), true);
+    assert.strictEqual(ext.settingTypeOk('editor.fontLigatures', "'calt'"), true);
+    assert.strictEqual(ext.settingTypeOk('editor.fontLigatures', 42), false);
+    // NaN / Infinity 会在 CSS 里产出非法值
+    assert.strictEqual(ext.settingTypeOk('editor.fontSize', NaN), false);
+    assert.strictEqual(ext.settingTypeOk('editor.fontSize', Infinity), false);
+    // 未列入白名单的键
+    assert.strictEqual(ext.settingTypeOk('evil.key', 1), false);
+});
+
+test('importConfig 拒绝非本插件的文件', async () => {
+    for (const bad of [null, 42, 'str', {}, { kind: 'other' }]) {
+        await assert.rejects(() => ext.importConfig(bad), /不是 JSON 对象|不是美化控制台/);
+    }
+});
+
 test('sanitizeState 对垃圾输入不抛异常', () => {
     for (const junk of [null, undefined, 42, 'str', [], { regions: 'nope' }, { regions: { editor: null } }]) {
         const r = ext.sanitizeState(junk);
