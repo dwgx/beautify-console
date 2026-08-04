@@ -54,9 +54,16 @@ module.exports = {
     workspace: {
         getConfiguration: () => ({
             get: (k) => store.get(k),
-            update: async (k, v) => { store.set(k, v); }
+            update: async (k, v) => {
+                // 复现 VS Code 对未注册键的行为
+                if (module.exports.__failKeys.has(k)) {
+                    throw new Error(`没有注册配置 ${k},因此无法写入 用户设置。`);
+                }
+                store.set(k, v);
+            }
         })
     },
     // 测试辅助
-    __store: store
+    __store: store,
+    __failKeys: new Set()
 };

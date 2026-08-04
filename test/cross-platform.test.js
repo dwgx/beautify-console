@@ -125,6 +125,36 @@ test('currentFontName 从 fontFamily 里取首选字体', () => {
     assert.strictEqual(ext.currentFontName(undefined), 'JetBrains Mono');
 });
 
+test('applicable 在 macOS 上滤掉未注册的 window.menuBarVisibility', () => {
+    const updates = [['editor.fontSize', 14], ['window.menuBarVisibility', 'compact'], ['editor.minimap.enabled', true]];
+    onPlatform('darwin', () => {
+        const keys = ext.applicable(updates).map(([k]) => k);
+        assert.deepStrictEqual(keys, ['editor.fontSize', 'editor.minimap.enabled']);
+    });
+    onPlatform('win32', () => {
+        assert.strictEqual(ext.applicable(updates).length, 3, '非 macOS 平台不应滤掉菜单栏设置');
+        assert.deepStrictEqual(ext.platformSkipKeys(), []);
+    });
+});
+
+test('setConfig 单键写入失败不中断整批(未注册键不再吃掉后续设置)', async () => {
+    const vscodeStub = require('./vscode-stub.js');
+    vscodeStub.__failKeys.add('some.unregistered.key');
+    try {
+        const failed = await ext.setConfig([
+            ['editor.fontSize', 15],
+            ['some.unregistered.key', 'boom'],
+            ['editor.lineHeight', 1.7]
+        ]);
+        assert.deepStrictEqual(failed, ['some.unregistered.key']);
+        // 关键:失败键之后的设置必须照样写入
+        assert.strictEqual(vscodeStub.__store.get('editor.lineHeight'), 1.7);
+        assert.strictEqual(vscodeStub.__store.get('editor.fontSize'), 15);
+    } finally {
+        vscodeStub.__failKeys.delete('some.unregistered.key');
+    }
+});
+
 // —— 端到端:这条直接复现原 bug(文件写到不存在的 Windows 目录 → 静默失效) ——
 test('激活后在解析出的 User 目录下自举,并清理跨平台残留 import', async () => {
     const fs = require('node:fs');
@@ -150,6 +180,8 @@ test('激活后在解析出的 User 目录下自举,并清理跨平台残留 imp
         await new Promise(r => setTimeout(r, 50));   // bootstrap 不被 await,等它落盘
 
         assert.deepStrictEqual(vscodeStub.window.errors, [], '自举不应报错');
+        // 标记文件写不成 → 每次启动重复跑初始化并重复报错(1.0.4 的回归)
+        assert.ok(fs.existsSync(path.join(userDir, '.beautify-init-done')), '初始化标记应写成');
         assert.ok(fs.existsSync(path.join(userDir, 'cus-base.css')), 'cus-base.css 应写在解析出的 User 目录');
         assert.ok(fs.existsSync(path.join(userDir, 'cus-dynamic.css')), 'cus-dynamic.css 应写在解析出的 User 目录');
         assert.match(fs.readFileSync(path.join(userDir, 'cus-dynamic.css'), 'utf8'), /ANIM:default/);

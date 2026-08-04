@@ -34,9 +34,11 @@ find_code_cli() {
 CODE_CLI="$(find_code_cli || true)"
 
 # 3. 复制本项目到扩展目录(版本号取自 package.json,与 vsix 安装保持一致)
-VERSION="$(node -p "require('$SRC/package.json').version" 2>/dev/null || echo "1.0.4")"
+VERSION="$(node -p "require('$SRC/package.json').version" 2>/dev/null || echo "1.0.5")"
 TARGET="$EXT_ROOT/dwgx.beautify-console-$VERSION"
 echo "复制到: $TARGET"
+# 清掉本扩展的旧版本目录 —— 同 ID 多份会被 VS Code 视为冲突
+find "$EXT_ROOT" -maxdepth 1 -type d -name 'dwgx.beautify-console-*' -exec rm -rf {} +
 rm -rf "$TARGET"
 mkdir -p "$TARGET"
 cp "$SRC/extension.js" "$SRC/package.json" "$SRC/README.md" "$SRC/LICENSE" "$TARGET/"

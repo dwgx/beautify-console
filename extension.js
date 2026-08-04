@@ -148,11 +148,34 @@ async function reloadCUS() {
     catch (e) { vscode.window.showWarningMessage('已改配置,但自动 reload 失败,请手动运行 "Custom UI Style: Reload"。'); }
 }
 
+// 平台不适用的设置键 —— 写入未注册的键会抛「没有注册配置」。
+// macOS 的菜单栏由系统顶栏接管,VS Code 在该平台不注册 window.menuBarVisibility。
+// 写成函数而非常量,便于按平台断言。
+function platformSkipKeys() {
+    return process.platform === 'darwin' ? ['window.menuBarVisibility'] : [];
+}
+
+// 滤掉当前平台不适用的键
+function applicable(updates) {
+    const skip = platformSkipKeys();
+    return updates.filter(([key]) => !skip.includes(key));
+}
+
+// 逐键写入。单个键失败(未注册 / 已废弃 / 平台不适用)不再中断整批 ——
+// 之前一个键抛错会让它后面的设置全部漏写,且首次初始化标记写不成,
+// 于是每次启动重复报错。失败的键收集后返回,同时打日志,不静默吞掉。
 async function setConfig(updates) {
     const cfg = vscode.workspace.getConfiguration();
-    for (const [key, val] of updates) {
-        await cfg.update(key, val, vscode.ConfigurationTarget.Global);
+    const failed = [];
+    for (const [key, val] of applicable(updates)) {
+        try {
+            await cfg.update(key, val, vscode.ConfigurationTarget.Global);
+        } catch (e) {
+            failed.push(key);
+            console.warn(`[美化控制台] 写入设置失败 ${key}: ${e.message}`);
+        }
     }
+    return failed;
 }
 
 // 合并 stylesheet: 应用动画档 + 代码区背景(互不干扰)
@@ -688,7 +711,8 @@ module.exports = {
     // 下列导出供 test/ 下的跨平台用例调用
     defaultUserDir, resolveUserDir, getUserDir, cusBaseCss, cusDynamicCss,
     toFileUrl, fromFileUrl, isStaleManagedImport, MANAGED_CSS_NAMES,
-    fontDirs, fallbackFonts, fontStack, listFonts, currentFontName
+    fontDirs, fallbackFonts, fontStack, listFonts, currentFontName,
+    setConfig, applicable, platformSkipKeys
 };
 
 function getHtml() {
