@@ -35,9 +35,25 @@
 ```bash
 git clone https://github.com/dwgx/beautify-console
 cd beautify-console
-# Windows 一键注册脚本
+
+# macOS / Linux
+bash install.sh
+
+# Windows
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
+
+装完需要**完全退出** VS Code 再启动（macOS 是 `Command + Q`，不是关窗口；Windows 需结束所有 `Code.exe`）。`Reload Window` 不会刷新 Custom UI Style 的 external.css 缓存。
+
+### 🍎 macOS 补充说明
+
+- macOS 默认不把 `code` 命令加进 PATH，`install.sh` 会自动回退到 app bundle 里自带的二进制，无需手动配置
+- 样式注入需要写入 `/Applications/Visual Studio Code.app`。若注入时报 `Maximum call stack size exceeded`，先完全退出 VS Code 再执行：
+  ```bash
+  sudo chown -R $(whoami) "/Applications/Visual Studio Code.app"
+  ```
+- 「菜单栏」一项在 macOS 上不显示——菜单由系统顶栏接管，`window.menuBarVisibility` 无效
+- 若你在 Windows 上用过本扩展并开了 Settings Sync：同步过来的 `custom-ui-style.external.imports` 里会残留 Windows 路径（`file://C:/Users/...`），这些条目在 macOS 上解析不到文件。**v1.0.4 起会在激活时自动清理**，你自己手加的 import 不受影响
 
 ## 🖱 使用 Usage
 
@@ -48,10 +64,17 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 ## ⚠️ 说明 Notes
 
+- 支持 Windows / macOS / Linux。用户目录、字体扫描目录、`file://` URL 均按平台解析
 - 本扩展通过修改 VS Code 核心文件注入样式（经由 Custom UI Style），这是非官方手段：
   - 启动时可能出现「安装似乎已损坏」黄条，点齿轮「不再显示」即可
   - **VS Code 更新后**样式可能失效 → 重新运行 `Custom UI Style: Reload`
 - 背景图会自动复制到用户目录，不怕原图移动丢失
+
+## 🧪 开发 Development
+
+```bash
+npm test    # 跨平台路径 / 字体 / 导入清理 用例（node --test，无第三方依赖）
+```
 
 ## 🙏 致谢 Credits
 

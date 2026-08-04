@@ -4,3 +4,6 @@ node_modules/**
 *.vsix
 plans/**
 media/screenshot*.png
+test/**
+install.ps1
+install.sh

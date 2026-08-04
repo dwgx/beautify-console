@@ -2,16 +2,75 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { pathToFileURL } = require('url');
 
-const USER_DIR = path.join(os.homedir(), 'AppData/Roaming/Code/User');
-const CUS_BASE_CSS = path.join(USER_DIR, 'cus-base.css');
+// ============================================================
+// 用户数据目录解析(跨平台)
+// 旧版本把 Windows 的 AppData 路径写死,于是 macOS/Linux 上所有读写
+// (CSS / 背景图 / 标记文件)都落在不存在的目录里,插件静默失效。
+// 现在优先从 context.globalStorageUri 反推:
+//   <userDir>/globalStorage/<publisher>.<name> → 上两级就是 User 目录
+// 这样 Insiders、便携版、自定义 --user-data-dir 也都能对上。
+// ============================================================
+let userDir = null;
+
+// 拿不到 context 时按平台兜底
+function defaultUserDir() {
+    if (process.platform === 'win32') {
+        const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData/Roaming');
+        return path.join(appData, 'Code/User');
+    }
+    if (process.platform === 'darwin') {
+        return path.join(os.homedir(), 'Library/Application Support/Code/User');
+    }
+    const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+    return path.join(configHome, 'Code/User');
+}
+
+function resolveUserDir(context) {
+    try {
+        const globalStorage = context && context.globalStorageUri && context.globalStorageUri.fsPath;
+        if (globalStorage) {
+            const dir = path.resolve(globalStorage, '..', '..');
+            if (path.basename(dir) === 'User') {
+                userDir = dir;
+                return userDir;
+            }
+        }
+    } catch (e) { /* 落到兜底 */ }
+    userDir = defaultUserDir();
+    return userDir;
+}
+
+function getUserDir() {
+    if (!userDir) userDir = defaultUserDir();
+    return userDir;
+}
+
+// 本插件管理的两个 CSS 文件(路径随 userDir 动态解析,不能提前算成常量)
+const cusBaseCss = () => path.join(getUserDir(), 'cus-base.css');
+const cusDynamicCss = () => path.join(getUserDir(), 'cus-dynamic.css');
+
+// 绝对路径 → file:// URL。pathToFileURL 会正确处理盘符与空格转义,
+// 且能被 Custom UI Style 内部的 fileURLToPath 原样还原。
+function toFileUrl(p) {
+    return pathToFileURL(p).toString();
+}
+
+// file:// URL → 本地路径。用 vscode.Uri 解析,兼容历史遗留的
+// `file:////Users/...`(四斜杠)与 Windows `file:///C:/...` 两种旧格式。
+function fromFileUrl(fileUrl) {
+    const s = String(fileUrl);
+    if (!s.startsWith('file:')) return s;
+    try { return vscode.Uri.parse(s).fsPath; }
+    catch (e) { return s; }
+}
 
 // 把本地图片转成 base64 data URI —— 绕过 workbench CSP 对 file:/// 的拦截(关键修复)
 function imageToDataUri(fileUrl) {
     try {
-        // file:///C:/... → C:\...
-        let p = String(fileUrl).replace(/^file:\/\/\//, '').replace(/\//g, '\\');
-        p = decodeURIComponent(p);
+        if (!fileUrl || String(fileUrl).startsWith('data:')) return fileUrl;
+        const p = fromFileUrl(fileUrl);
         if (!fs.existsSync(p)) return fileUrl; // 找不到就退回原路径
         const ext = (path.extname(p).slice(1) || 'png').toLowerCase();
         const mime = ext === 'jpg' ? 'jpeg' : ext;
@@ -121,21 +180,21 @@ function buildStylesheet(current, animMode, bgMode, bgUrl) {
 // 改 cus-base.css 里的圆角基准变量(只改 --r 那一行,可反复修改不损坏)
 function setRadius(px) {
     try {
-        let css = fs.readFileSync(CUS_BASE_CSS, 'utf8');
+        let css = fs.readFileSync(cusBaseCss(), 'utf8');
         if (/--r:\s*\d+px/.test(css)) {
             css = css.replace(/--r:\s*\d+px/, `--r: ${px}px`);
         } else {
             // 兼容:文件没有变量则补一行
             css = ':root { --r: ' + px + 'px; }\n' + css;
         }
-        fs.writeFileSync(CUS_BASE_CSS, css);
+        fs.writeFileSync(cusBaseCss(), css);
         return true;
     } catch (e) { return false; }
 }
 // 读当前圆角值
 function getRadius() {
     try {
-        const m = fs.readFileSync(CUS_BASE_CSS, 'utf8').match(/--r:\s*(\d+)px/);
+        const m = fs.readFileSync(cusBaseCss(), 'utf8').match(/--r:\s*(\d+)px/);
         return m ? parseInt(m[1], 10) : 8;
     } catch (e) { return 8; }
 }
@@ -145,7 +204,6 @@ function getRadius() {
 // 关键修复:此版本 Custom UI Style 不注入 stylesheet 设置,只注入 imports 的文件。
 // 所以动画和背景都必须写成真实 CSS 文件。
 // ============================================================
-const CUS_DYNAMIC_CSS = path.join(USER_DIR, 'cus-dynamic.css');
 
 // {选择器: 规则} 对象 → CSS 文本
 function cssFromObj(obj) {
@@ -170,64 +228,108 @@ function writeDynamicCss(animMode, bgMode) {
         const dataUri = imageToDataUri(bgUrl);
         out += '/* ---- 仅代码区背景 ---- */\n' + cssFromObj(codeOnlyCss(dataUri, getCodeOpacity())) + '\n';
     }
-    try { fs.writeFileSync(CUS_DYNAMIC_CSS, out); return true; } catch (e) { return false; }
+    try { fs.writeFileSync(cusDynamicCss(), out); return true; } catch (e) { return false; }
 }
 
 // 从 cus-dynamic.css 的标记注释读当前模式
 function readDynamicModes() {
     try {
-        const c = fs.readFileSync(CUS_DYNAMIC_CSS, 'utf8');
+        const c = fs.readFileSync(cusDynamicCss(), 'utf8');
         const a = c.match(/ANIM:(\w+)/); const b = c.match(/BG:(\w+)/);
         return { animMode: a ? a[1] : 'default', bgModeCss: b ? b[1] : 'off' };
     } catch (e) { return { animMode: 'default', bgModeCss: 'off' }; }
 }
 
-// 常见编程字体候选(展示名 → 文件名关键字,用于检测是否已装)
+// 常见编程字体候选(展示名 → 文件名关键字列表,用于检测是否已装)
+// 同一字体在不同系统的文件名可能不同(如 SF Mono 有 SFMono-Regular / SFNSMono 两种)
 const CODING_FONTS = [
-    ['JetBrains Mono', 'jetbrainsmono'],
-    ['Fira Code', 'firacode'],
-    ['Cascadia Code', 'cascadiacode'],
-    ['Cascadia Mono', 'cascadiamono'],
-    ['Source Code Pro', 'sourcecodepro'],
-    ['Consolas', 'consola'],
-    ['Hack', 'hack'],
-    ['IBM Plex Mono', 'ibmplexmono'],
-    ['Roboto Mono', 'robotomono'],
-    ['Ubuntu Mono', 'ubuntumono'],
-    ['DejaVu Sans Mono', 'dejavusansmono'],
-    ['Courier New', 'cour'],
-    ['MesloLGS NF', 'meslolgs'],
-    ['Maple Mono', 'maplemono'],
-    ['Victor Mono', 'victormono'],
-    ['Operator Mono', 'operatormono']
+    ['JetBrains Mono', ['jetbrainsmono']],
+    ['Fira Code', ['firacode']],
+    ['Cascadia Code', ['cascadiacode']],
+    ['Cascadia Mono', ['cascadiamono']],
+    ['Source Code Pro', ['sourcecodepro']],
+    ['SF Mono', ['sfmono', 'sfnsmono']],
+    ['Menlo', ['menlo']],
+    ['Monaco', ['monaco']],
+    ['Consolas', ['consola']],
+    ['Hack', ['hack']],
+    ['IBM Plex Mono', ['ibmplexmono']],
+    ['Roboto Mono', ['robotomono']],
+    ['Ubuntu Mono', ['ubuntumono']],
+    ['DejaVu Sans Mono', ['dejavusansmono']],
+    ['Liberation Mono', ['liberationmono']],
+    ['Noto Sans Mono', ['notosansmono']],
+    ['Courier New', ['couriernew']],
+    ['MesloLGS NF', ['meslolgs']],
+    ['Maple Mono', ['maplemono']],
+    ['Victor Mono', ['victormono']],
+    ['Operator Mono', ['operatormono']]
 ];
 
-// 扫描已安装字体文件名(小写去空格),用于标记哪些编程字体已装
-function scannedFontFiles() {
-    const dirs = [
-        path.join(process.env.LOCALAPPDATA || '', 'Microsoft/Windows/Fonts'),
-        'C:/Windows/Fonts'
-    ];
-    let names = new Set();
-    for (const d of dirs) {
-        try {
-            for (const f of fs.readdirSync(d)) {
-                if (/\.(ttf|otf|ttc)$/i.test(f)) names.add(f.toLowerCase().replace(/[\s_-]/g, ''));
-            }
-        } catch (e) { /* 目录不存在忽略 */ }
+// 各平台字体安装目录
+function fontDirs() {
+    const home = os.homedir();
+    if (process.platform === 'win32') {
+        const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData/Local');
+        const winDir = process.env.WINDIR || 'C:/Windows';
+        return [path.join(localAppData, 'Microsoft/Windows/Fonts'), path.join(winDir, 'Fonts')];
     }
+    if (process.platform === 'darwin') {
+        return [
+            path.join(home, 'Library/Fonts'),
+            '/Library/Fonts',
+            '/System/Library/Fonts',
+            '/System/Library/Fonts/Supplemental'
+        ];
+    }
+    const dataHome = process.env.XDG_DATA_HOME || path.join(home, '.local/share');
+    return [path.join(dataHome, 'fonts'), path.join(home, '.fonts'), '/usr/share/fonts', '/usr/local/share/fonts'];
+}
+
+// 递归收集字体文件名(小写去分隔符)。Linux 的 /usr/share/fonts 按 truetype/ 等
+// 子目录分层,所以要下钻;depth 限制 2 层,避免在大目录上白跑。
+function collectFontNames(dir, names, depth) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (e) { return; } // 目录不存在或无权限,忽略
+    for (const entry of entries) {
+        if (entry.isDirectory()) {
+            if (depth > 0) collectFontNames(path.join(dir, entry.name), names, depth - 1);
+        } else if (/\.(ttf|otf|ttc|dfont)$/i.test(entry.name)) {
+            names.add(entry.name.toLowerCase().replace(/[\s_-]/g, ''));
+        }
+    }
+}
+
+// 扫描已安装字体文件名,用于标记哪些编程字体已装
+function scannedFontFiles() {
+    const names = new Set();
+    for (const d of fontDirs()) collectFontNames(d, names, 2);
     return names;
 }
 
 // 返回字体列表:[{name, installed}],已装的排前面
 function listFonts() {
-    const files = scannedFontFiles();
-    const arr = CODING_FONTS.map(([name, key]) => {
-        const installed = [...files].some(f => f.includes(key));
+    const files = [...scannedFontFiles()];
+    const arr = CODING_FONTS.map(([name, keys]) => {
+        const installed = keys.some(key => files.some(f => f.includes(key)));
         return { name, installed };
     });
     arr.sort((a, b) => (b.installed - a.installed));
     return arr;
+}
+
+// 各平台自带的等宽字体兜底链 —— Consolas 只有 Windows 有,
+// macOS 用 Menlo/Monaco,Linux 用 DejaVu,否则字体设置会落到衬线字体上。
+function fallbackFonts() {
+    if (process.platform === 'darwin') return ["Menlo", "Monaco", "monospace"];
+    if (process.platform === 'win32') return ["Consolas", "Courier New", "monospace"];
+    return ["DejaVu Sans Mono", "Liberation Mono", "monospace"];
+}
+
+// 组装 editor.fontFamily 值:首选字体 + 当前平台兜底链
+function fontStack(primary) {
+    return [primary, ...fallbackFonts()].map(f => (/\s/.test(f) ? `'${f}'` : f)).join(', ');
 }
 
 // 从 editor.fontFamily 里取出首选字体名(去引号)
@@ -296,12 +398,28 @@ function readState() {
         productIconTheme: c.get('workbench.productIconTheme'),
         themes: listThemes('color'),
         iconThemes: listThemes('icon'),
-        productThemes: listThemes('product')
+        productThemes: listThemes('product'),
+        platform: process.platform
     };
 }
 
 // 首次激活标记文件
-const INIT_DONE_FILE = path.join(USER_DIR, '.beautify-init-done');
+const initDoneFile = () => path.join(getUserDir(), '.beautify-init-done');
+
+// 本插件在 imports 里管理的文件名 —— 用于剔除其它机器同步过来的旧条目
+const MANAGED_CSS_NAMES = ['cus-base.css', 'cus-dynamic.css'];
+
+// settings.json 会被 Settings Sync 同步,于是 Windows 上写的
+// `file://C:/Users/xxx/AppData/...` 会跟到 macOS/Linux。这些路径在本机
+// 解析不出文件,Custom UI Style 对每个条目单独 try/catch,于是静默产出空
+// CSS —— 表现就是「装了但完全没反应」。这里只剔除本插件管理的那两个文件
+// 且指向本机之外的条目,用户自己加的 import 一律保留。
+function isStaleManagedImport(entry, keep) {
+    if (typeof entry !== 'string' || !entry.startsWith('file://')) return false;
+    if (keep.includes(entry)) return false;
+    const name = path.basename(fromFileUrl(entry));
+    return MANAGED_CSS_NAMES.includes(name);
+}
 
 // 自举:新机器首次激活,创建 CSS 文件并登记进 Custom UI Style 的 imports
 // 首次安装时自动应用 JetBrains 默认参数
@@ -314,32 +432,37 @@ async function bootstrap() {
             '@keyframes apc-bounce-in { 0% { opacity: 0; transform: scale(0.9) translateY(-8px); } 60% { opacity: 1; transform: scale(1.02) translateY(2px); } 100% { opacity: 1; transform: scale(1) translateY(0); } }\n' +
             '@keyframes apc-zoom-in { from { opacity: 0; transform: scale(0.92); } to { opacity: 1; transform: scale(1); } }\n' +
             '@keyframes apc-flip-in { from { opacity: 0; transform: perspective(400px) rotateX(-12deg); } to { opacity: 1; transform: perspective(400px) rotateX(0); } }\n';
-        if (!fs.existsSync(CUS_BASE_CSS)) fs.writeFileSync(CUS_BASE_CSS, baseTpl);
-        if (!fs.existsSync(CUS_DYNAMIC_CSS) || fs.readFileSync(CUS_DYNAMIC_CSS, 'utf8').trim().length < 20) {
+        fs.mkdirSync(getUserDir(), { recursive: true });
+        if (!fs.existsSync(cusBaseCss())) fs.writeFileSync(cusBaseCss(), baseTpl);
+        if (!fs.existsSync(cusDynamicCss()) || fs.readFileSync(cusDynamicCss(), 'utf8').trim().length < 20) {
             writeDynamicCss('default', 'off');
         }
         const cfg = vscode.workspace.getConfiguration();
         const imports = cfg.get('custom-ui-style.external.imports') || [];
-        const need = ['file://' + CUS_BASE_CSS.replace(/\\/g, '/'), 'file://' + CUS_DYNAMIC_CSS.replace(/\\/g, '/')];
-        let changed = false;
-        for (const im of need) if (!imports.includes(im)) { imports.push(im); changed = true; }
+        const need = [toFileUrl(cusBaseCss()), toFileUrl(cusDynamicCss())];
+        const kept = imports.filter(im => !isStaleManagedImport(im, need));
+        let changed = kept.length !== imports.length;
+        for (const im of need) if (!kept.includes(im)) { kept.push(im); changed = true; }
         if (changed) {
-            await cfg.update('custom-ui-style.external.imports', imports, vscode.ConfigurationTarget.Global);
+            await cfg.update('custom-ui-style.external.imports', kept, vscode.ConfigurationTarget.Global);
             await cfg.update('custom-ui-style.external.loadStrategy', 'refetch', vscode.ConfigurationTarget.Global);
             await cfg.update('custom-ui-style.reloadWithoutPrompting', true, vscode.ConfigurationTarget.Global);
         }
         // 首次安装:自动应用 JetBrains 默认参数
-        if (!fs.existsSync(INIT_DONE_FILE)) {
+        if (!fs.existsSync(initDoneFile())) {
             await applyJetBrainsDefaults();
-            fs.writeFileSync(INIT_DONE_FILE, new Date().toISOString());
+            fs.writeFileSync(initDoneFile(), new Date().toISOString());
         }
-    } catch (e) {}
+    } catch (e) {
+        // 自举失败会导致整个面板无声失效,必须让用户看见原因
+        vscode.window.showErrorMessage(`美化控制台: 初始化失败 (${getUserDir()}) — ${e.message}`);
+    }
 }
 
 // 首次安装时自动应用的 JetBrains 默认参数(与 restoreDefaults 一致但不弹通知、不 reload)
 async function applyJetBrainsDefaults() {
     await setConfig([
-        ['editor.fontFamily', "'JetBrains Mono', Consolas, 'Courier New', monospace"],
+        ['editor.fontFamily', fontStack('JetBrains Mono')],
         ['editor.fontSize', 14],
         ['editor.lineHeight', 1.6],
         ['editor.fontWeight', '400'],
@@ -360,7 +483,7 @@ async function applyJetBrainsDefaults() {
         ['workbench.colorTheme', 'Int UI Dark'],
         ['workbench.iconTheme', 'int-ui-icons-dark'],
         ['workbench.productIconTheme', 'jetbrains-product-icon-theme'],
-        ['terminal.integrated.fontFamily', "'JetBrains Mono', monospace"]
+        ['terminal.integrated.fontFamily', fontStack('JetBrains Mono')]
     ]);
     setRadius(8);
     await setConfig([['custom-ui-style.background.opacity', 0.92]]);
@@ -370,6 +493,7 @@ async function applyJetBrainsDefaults() {
 
 function activate(context) {
     let panel = null;
+    resolveUserDir(context);   // 必须在 bootstrap 之前:所有文件路径都依赖它
     bootstrap();
 
     context.subscriptions.push(vscode.commands.registerCommand('beautify.openPanel', () => {
@@ -396,13 +520,13 @@ function activate(context) {
 
 const DEFAULT_BG = '';
 // 「选了哪张图」独立持久化,与「用哪个模式」完全分开(修复选图跳全窗口的 bug)
-const CHOSEN_IMG_FILE = path.join(USER_DIR, '.beautify-bg-image');
+const chosenImgFile = () => path.join(getUserDir(), '.beautify-bg-image');
 function getChosenImage() {
-    try { const v = fs.readFileSync(CHOSEN_IMG_FILE, 'utf8').trim(); return v || DEFAULT_BG; }
+    try { const v = fs.readFileSync(chosenImgFile(), 'utf8').trim(); return v || DEFAULT_BG; }
     catch (e) { return DEFAULT_BG; }
 }
 function setChosenImage(url) {
-    try { fs.writeFileSync(CHOSEN_IMG_FILE, url || ''); } catch (e) {}
+    try { fs.writeFileSync(chosenImgFile(), url || ''); } catch (e) {}
 }
 
 // 背景模式应用 —— 全窗口用 background.url;仅代码区写进 cus-dynamic.css;动画保持
@@ -458,11 +582,11 @@ async function promptRestart() {
 async function handleMessage(msg, panel) {
     try {
         if (msg.type === 'setFont') {
-            // 选字体名 → 组装带 fallback 的 fontFamily(编辑器+终端一起)
-            const ff = `'${msg.value}', Consolas, 'Courier New', monospace`;
+            // 选字体名 → 组装带平台兜底链的 fontFamily(编辑器+终端一起)
+            const ff = fontStack(msg.value);
             await setConfig([
                 ['editor.fontFamily', ff],
-                ['terminal.integrated.fontFamily', `'${msg.value}', monospace`]
+                ['terminal.integrated.fontFamily', ff]
             ]);
         } else if (msg.type === 'setNative') {
             const key = NATIVE_MAP[msg.key];
@@ -493,10 +617,10 @@ async function handleMessage(msg, panel) {
             const uri = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { 图片: ['png', 'jpg', 'jpeg', 'webp'] } });
             if (uri && uri[0]) {
                 const p = uri[0].fsPath;
-                const dest = path.join(USER_DIR, 'backgrounds', path.basename(p));
+                const dest = path.join(getUserDir(), 'backgrounds', path.basename(p));
                 fs.mkdirSync(path.dirname(dest), { recursive: true });
                 fs.copyFileSync(p, dest);
-                const url = 'file:///' + dest.replace(/\\/g, '/');
+                const url = toFileUrl(dest);
                 // 只存图,不改模式:保存到独立文件,再按【当前模式】重新应用
                 setChosenImage(url);
                 const curMode = readState().bgMode;
@@ -524,7 +648,7 @@ async function handleMessage(msg, panel) {
 // 恢复默认 —— 复位到我们这套 JetBrains 配置(固定快照)
 async function restoreDefaults(panel) {
     await setConfig([
-        ['editor.fontFamily', "'JetBrains Mono', Consolas, 'Courier New', monospace"],
+        ['editor.fontFamily', fontStack('JetBrains Mono')],
         ['editor.fontSize', 14],
         ['editor.lineHeight', 1.6],
         ['editor.fontWeight', '400'],
@@ -559,7 +683,13 @@ async function restoreDefaults(panel) {
 }
 
 function deactivate() {}
-module.exports = { activate, deactivate };
+module.exports = {
+    activate, deactivate,
+    // 下列导出供 test/ 下的跨平台用例调用
+    defaultUserDir, resolveUserDir, getUserDir, cusBaseCss, cusDynamicCss,
+    toFileUrl, fromFileUrl, isStaleManagedImport, MANAGED_CSS_NAMES,
+    fontDirs, fallbackFonts, fontStack, listFonts, currentFontName
+};
 
 function getHtml() {
     return `<!DOCTYPE html>
@@ -752,7 +882,7 @@ input[type=range]:active::-webkit-slider-thumb { transform: scale(1.25); }
         <div class="row"><label>状态栏<span class="q" tabindex="0" data-tip="窗口最底部那条信息栏,显示 Git 分支、光标行列、文件编码等。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="statusBar"><span class="slider-sw"></span></label></div></div>
         <div class="row"><label>面包屑导航<span class="q" tabindex="0" data-tip="编辑器顶部显示当前文件的路径层级(如 src > main > App.java),点它能快速跳转。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="breadcrumbs"><span class="slider-sw"></span></label></div></div>
         <div class="row"><label>活动栏位置<span class="q" tabindex="0" data-tip="最左边那排大图标(资源管理器/搜索/Git)放在哪。放顶部更接近 IntelliJ 的样子。">?</span></label><div class="ctrl"><select id="activityBar"><option value="top">顶部</option><option value="default">默认(左侧)</option><option value="bottom">底部</option><option value="hidden">隐藏</option></select></div></div>
-        <div class="row"><label>菜单栏<span class="q" tabindex="0" data-tip="文件/编辑/查看那一排菜单。紧凑=收成一个汉堡按钮,更省空间。">?</span></label><div class="ctrl"><select id="menuBar"><option value="compact">紧凑(汉堡)</option><option value="visible">显示</option><option value="hidden">隐藏</option></select></div></div>
+        <div class="row" id="rowMenuBar"><label>菜单栏<span class="q" tabindex="0" data-tip="文件/编辑/查看那一排菜单。紧凑=收成一个汉堡按钮,更省空间。">?</span></label><div class="ctrl"><select id="menuBar"><option value="compact">紧凑(汉堡)</option><option value="visible">显示</option><option value="hidden">隐藏</option></select></div></div>
         <div class="row"><label>标签页缩放<span class="q" tabindex="0" data-tip="打开很多文件时,顶部一排标签怎么排。收缩=自动变窄尽量都塞下。">?</span></label><div class="ctrl"><select id="tabSizing"><option value="fit">适应</option><option value="shrink">收缩</option><option value="fixed">固定</option></select></div></div>
     </div>
 
@@ -827,11 +957,18 @@ if (S && S.fonts) render();
 function render(){
     // 字体下拉:已装的标 ✓,未装的标(未安装)
     const fsel = $('fontName'); fsel.innerHTML='';
+    // macOS 的菜单栏在系统顶栏,window.menuBarVisibility 无效,整行隐藏
+    const rowMenuBar = $('rowMenuBar');
+    if (rowMenuBar) rowMenuBar.style.display = (S.platform === 'darwin') ? 'none' : '';
     let fonts = S.fonts;
-    // 兜底:若后端没返回字体列表,至少给一组常见字体,避免空白
+    // 兜底:若后端没返回字体列表,至少给一组当前平台常见的字体,避免空白
     if (!fonts || !fonts.length) {
-        fonts = ['JetBrains Mono','Fira Code','Cascadia Code','Consolas','Source Code Pro','Courier New']
-            .map(n => ({ name: n, installed: false }));
+        const common = S.platform === 'darwin'
+            ? ['JetBrains Mono','Fira Code','SF Mono','Menlo','Monaco','Courier New']
+            : S.platform === 'win32'
+            ? ['JetBrains Mono','Fira Code','Cascadia Code','Consolas','Source Code Pro','Courier New']
+            : ['JetBrains Mono','Fira Code','Source Code Pro','DejaVu Sans Mono','Liberation Mono','Noto Sans Mono'];
+        fonts = common.map(n => ({ name: n, installed: false }));
     }
     fonts.forEach(f=>{
         const o=document.createElement('option'); o.value=f.name;
