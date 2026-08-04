@@ -54,6 +54,11 @@ const cusDynamicCss = () => path.join(getUserDir(), 'cus-dynamic.css');
 // 因为 writeDynamicCss() 是整文件重写,放一起会被清掉。
 const cusCustomCss = () => path.join(getUserDir(), 'cus-custom.css');
 
+// 自定义 CSS 是否注入。关掉只是不登记进 imports,文件内容一律保留。
+function isCustomCssEnabled() {
+    return vscode.workspace.getConfiguration().get('beautify.customCss.enabled') !== false;
+}
+
 // 绝对路径 → file:// URL。pathToFileURL 会正确处理盘符与空格转义,
 // 且能被 Custom UI Style 内部的 fileURLToPath 原样还原。
 function toFileUrl(p) {
@@ -874,7 +879,9 @@ async function bootstrap() {
         }
         // cus-custom.css 放最后:external.imports 按数组顺序合并,靠后者在同
         // 优先级下胜出,用户手写规则才能压过我们生成的。
-        const need = [toFileUrl(cusBaseCss()), toFileUrl(cusDynamicCss()), toFileUrl(cusCustomCss())];
+        // 被紧急关闭时不登记它 —— 文件留着,用户写的东西不丢。
+        const need = [toFileUrl(cusBaseCss()), toFileUrl(cusDynamicCss())];
+        if (isCustomCssEnabled()) need.push(toFileUrl(cusCustomCss()));
         const kept = imports.filter(im => !isStaleManagedImport(im, need));
         let changed = kept.length !== imports.length;
         for (const im of need) if (!kept.includes(im)) { kept.push(im); changed = true; }
@@ -949,8 +956,48 @@ function activate(context) {
     context.subscriptions.push(
         vscode.commands.registerCommand('bgSwitcher.fullWindow', () => applyBg('full')),
         vscode.commands.registerCommand('bgSwitcher.codeOnly', () => applyBg('codeOnly')),
-        vscode.commands.registerCommand('bgSwitcher.off', () => applyBg('off'))
+        vscode.commands.registerCommand('bgSwitcher.off', () => applyBg('off')),
+        vscode.commands.registerCommand('beautify.panicDisableCustomCss', panicDisableCustomCss),
+        vscode.commands.registerCommand('beautify.openCustomCss', openCustomCss)
     );
+}
+
+// ============================================================
+// 自定义 CSS 的逃生门
+// 用户 CSS 能把 workbench 整个弄成 display:none,连命令面板(.quick-input-widget)
+// 也一起藏掉。但 CSS 破坏的是渲染、不是 JS —— 键绑定由 window 层监听处理,
+// 不依赖任何元素可见,所以绑了快捷键的命令在界面全黑时依然能触发。
+// 这是首要逃生手段;命令面板可能已经不可用,不能只靠它。
+// 注意 code --disable-extensions 救不了:CUS 的补丁是写进 VS Code 自身文件的,
+// 禁用扩展不会还原已落盘的改动。
+// ============================================================
+async function panicDisableCustomCss() {
+    await setConfig([['beautify.customCss.enabled', false]]);
+    const cfg = vscode.workspace.getConfiguration();
+    const imports = (cfg.get('custom-ui-style.external.imports') || [])
+        .filter(im => im !== toFileUrl(cusCustomCss()));
+    await cfg.update('custom-ui-style.external.imports', imports, vscode.ConfigurationTarget.Global);
+    vscode.window.showInformationMessage(
+        '已关闭自定义 CSS(文件内容保留在 cus-custom.css)。正在重载以恢复界面。');
+    await reloadCUS();
+}
+
+// 在编辑器里打开 cus-custom.css,并说清它需要什么才能生效
+async function openCustomCss() {
+    try {
+        fs.mkdirSync(getUserDir(), { recursive: true });
+        if (!fs.existsSync(cusCustomCss())) fs.writeFileSync(cusCustomCss(), '');
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(cusCustomCss()));
+        await vscode.window.showTextDocument(doc);
+        // 没有文件监听,改完必须显式重载;macOS 上那是整个应用退出重开
+        const hint = process.platform === 'darwin'
+            ? '改完点「应用并重载」—— macOS 会完全退出并重新打开 VS Code。'
+            : '改完点「应用并重载」使其生效。';
+        vscode.window.showInformationMessage(
+            `${hint} 写坏界面时按 ${process.platform === 'darwin' ? 'Cmd' : 'Ctrl'}+Alt+Shift+F12 一键关闭自定义 CSS。`);
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 打开自定义 CSS 失败 — ${e.message}`);
+    }
 }
 
 const DEFAULT_BG = '';
@@ -1130,6 +1177,7 @@ module.exports = {
     // 多区域背景 / 轮播
     REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
     imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss, safeImageName,
+    isCustomCssEnabled, panicDisableCustomCss,
     // 状态
     STATE_VERSION, stateFile, defaultState, sanitizeState, readBeautifyState, writeBeautifyState,
     migrateLegacyState, ANIM_MODES, BG_MODES,

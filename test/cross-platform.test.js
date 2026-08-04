@@ -176,6 +176,39 @@ test('setConfig 单键写入失败不中断整批(未注册键不再吃掉后续
     }
 });
 
+test('紧急关闭自定义 CSS:摘掉 import 但保留文件内容', async () => {
+    const fs = require('node:fs');
+    const vscodeStub = require('./vscode-stub.js');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-panic-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        const mine = '.monaco-workbench { display: none; }\n';   // 用户把界面写坏了
+        fs.writeFileSync(ext.cusCustomCss(), mine);
+
+        const customUrl = ext.toFileUrl(ext.cusCustomCss());
+        vscodeStub.__store.set('custom-ui-style.external.imports', [
+            ext.toFileUrl(path.join(userDir, 'cus-base.css')), customUrl
+        ]);
+        vscodeStub.__store.set('beautify.customCss.enabled', true);
+        assert.strictEqual(ext.isCustomCssEnabled(), true);
+
+        await ext.panicDisableCustomCss();
+
+        const imports = vscodeStub.__store.get('custom-ui-style.external.imports');
+        assert.ok(!imports.includes(customUrl), '自定义 CSS 必须从 imports 摘掉');
+        assert.strictEqual(vscodeStub.__store.get('beautify.customCss.enabled'), false);
+        assert.strictEqual(ext.isCustomCssEnabled(), false);
+        // 关键:用户写的东西不能因为紧急关闭就丢
+        assert.strictEqual(fs.readFileSync(ext.cusCustomCss(), 'utf8'), mine, '文件内容必须保留');
+    } finally {
+        // 桩的配置 store 是进程内共享的,关掉的开关会漏给后面的用例
+        vscodeStub.__store.set('beautify.customCss.enabled', true);
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('自定义 CSS 不被生成流程覆盖(第三个文件存在的理由)', () => {
     const fs = require('node:fs');
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-iso-'));

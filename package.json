@@ -54,6 +54,21 @@
             {
                 "command": "bgSwitcher.off",
                 "title": "美化: 背景-关闭"
+            },
+            {
+                "command": "beautify.panicDisableCustomCss",
+                "title": "美化: 紧急关闭自定义 CSS"
+            },
+            {
+                "command": "beautify.openCustomCss",
+                "title": "美化: 编辑自定义 CSS"
+            }
+        ],
+        "keybindings": [
+            {
+                "command": "beautify.panicDisableCustomCss",
+                "key": "ctrl+alt+shift+f12",
+                "mac": "cmd+alt+shift+f12"
             }
         ],
         "configuration": {
@@ -65,6 +80,11 @@
                     "minimum": 0.05,
                     "maximum": 0.8,
                     "description": "仅代码区背景图的不透明度(独立于全窗口)"
+                },
+                "beautify.customCss.enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "是否注入自定义 CSS(cus-custom.css)。写坏界面时可用「美化: 紧急关闭自定义 CSS」一键关掉,快捷键 Cmd/Ctrl+Alt+Shift+F12"
                 }
             }
         }
