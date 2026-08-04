@@ -143,6 +143,143 @@ function codeOnlyCss(bgUrl, opacity) {
 }
 const CODE_ONLY_KEYS = Object.keys(codeOnlyCss('x', 0.92));
 
+// ============================================================
+// 多区域背景 —— 区域定义表
+// 选择器全部对 VS Code 1.131 的 workbench.desktop.main.css 核对过。
+// container 用 ::after 叠一层图;transparent 列出的子元素背景由 JS 写成内联
+// style.backgroundColor,只有 !important 压得过内联样式,否则图被完全盖住。
+// ============================================================
+const REGIONS = {
+    editor: {
+        label: '编辑器',
+        container: '.editor-group-container > .editor-container > .editor-instance',
+        transparent: [
+            '.monaco-editor, .monaco-editor .margin, .monaco-editor-background',
+            '.monaco-editor .minimap'
+        ],
+        defaultOpacity: 0.22
+    },
+    sidebar: {
+        label: '侧栏',
+        // .part > .content > .composite 是 workbench 的通用嵌套(侧栏的 composite
+        // 运行时还会带上 viewlet class,这里不依赖它,少一个失效点)
+        container: '.monaco-workbench .part.sidebar > .content > .composite',
+        transparent: [
+            '.monaco-workbench .part.sidebar',
+            '.monaco-workbench .part.sidebar .pane, .monaco-workbench .part.sidebar .pane-body',
+            '.monaco-workbench .part.sidebar .monaco-list-rows'
+        ],
+        defaultOpacity: 0.18
+    },
+    panel: {
+        label: '面板',
+        container: '.monaco-workbench .part.panel > .content > .composite',
+        transparent: [
+            '.monaco-workbench .part.panel',
+            '.monaco-workbench .part.panel > .content .monaco-editor, .monaco-workbench .part.panel > .content .monaco-editor .margin, .monaco-workbench .part.panel > .content .monaco-editor .monaco-editor-background',
+            '.monaco-workbench .part.panel .xterm-screen'
+        ],
+        defaultOpacity: 0.18
+    }
+};
+const REGION_KEYS = Object.keys(REGIONS);
+
+// 绝对路径 → workbench 可加载的 URL。
+// 关键:workbench 自身从 vscode-file://vscode-app/ 加载,所以 CSP 的
+// `img-src 'self'` 覆盖该 origin;而 Electron 的协议校验是 OR ——
+// 路径在白名单目录下【或】扩展名在白名单里(.png/.jpg/.jpeg/.webp/.gif/.bmp/.svg),
+// 后者让磁盘任意位置的图片都能直接引用。因此不必内联 base64:
+// 12 张 2MB 壁纸内联要 33MB CSS,改成 URL 只要 1KB。
+const VSCODE_FILE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.svg'];
+function toWorkbenchUrl(absPath) {
+    const p = String(absPath).replace(/\\/g, '/');
+    return 'vscode-file://vscode-app' + (p.startsWith('/') ? '' : '/') + encodeURI(p).replace(/[?#]/g, encodeURIComponent);
+}
+
+// 图片是否能走 vscode-file(扩展名在 Electron 白名单内);否则退回 base64 内联
+function canUseWorkbenchUrl(absPath) {
+    return VSCODE_FILE_EXTS.includes(path.extname(String(absPath)).toLowerCase());
+}
+
+// 单张图 → CSS url() 值。inline 为真时强制内联 base64(兜底开关)
+function imageCssUrl(absPath, inline) {
+    if (!absPath) return '';
+    if (!inline && canUseWorkbenchUrl(absPath)) return toWorkbenchUrl(absPath);
+    return imageToDataUri(toFileUrl(absPath));
+}
+
+// ============================================================
+// 轮播 keyframes 生成
+// 原理:background-image 是离散属性,不做插值,只在关键帧处突变。
+// 所以把换图放在 opacity=0 的那一帧,换图动作就看不见,单层伪元素即可淡入淡出。
+// 已在真实浏览器实测:3 图 / 210 次采样 / 4 次换图,换图时刻 opacity 最高
+// 0.0246(上限 0.22 的 11%),无硬切。
+// 注意 opacity 只能在 0..maxOpacity 之间动,maxOpacity 就是该区域配置的不透明度,
+// 不能动到 1,否则轮播时图会比静态时浓。
+// ============================================================
+const CAROUSEL_FADE_RATIO = 0.25;   // 淡入淡出各占单张时长的比例
+
+function carouselKeyframes(name, urls, maxOpacity, fadeRatio) {
+    const n = urls.length;
+    const slot = 100 / n;
+    const fade = slot * (fadeRatio == null ? CAROUSEL_FADE_RATIO : fadeRatio);
+    const op = maxOpacity;
+    const frames = [];
+    for (let i = 0; i < n; i++) {
+        const start = i * slot;
+        const img = `background-image: url("${urls[i]}")`;
+        frames.push(`    ${+start.toFixed(4)}% { ${img}; opacity: 0; }`);
+        frames.push(`    ${+(start + fade).toFixed(4)}% { ${img}; opacity: ${op}; }`);
+        frames.push(`    ${+(start + slot - fade).toFixed(4)}% { ${img}; opacity: ${op}; }`);
+    }
+    // 收尾帧回到第一张,让 linear infinite 无缝接上
+    frames.push(`    100% { background-image: url("${urls[0]}"); opacity: 0; }`);
+    return `@keyframes ${name} {\n${frames.join('\n')}\n}`;
+}
+
+// 单个区域的完整 CSS:透明化子元素 + ::after 图层(静态或轮播)
+// cfg: { images: string[], opacity: number, intervalMs: number, blend: boolean, inline: boolean }
+function regionCss(key, cfg) {
+    const region = REGIONS[key];
+    if (!region || !cfg || !cfg.images || !cfg.images.length) return '';
+    const urls = cfg.images.map(p => imageCssUrl(p, cfg.inline)).filter(Boolean);
+    if (!urls.length) return '';
+
+    const opacity = typeof cfg.opacity === 'number' ? cfg.opacity : region.defaultOpacity;
+    const out = [`/* ---- ${region.label} ---- */`];
+
+    // 子元素透明化 —— 必须 !important,背景色是内联样式写上去的
+    for (const sel of region.transparent) {
+        out.push(`${sel} { background-color: transparent !important; }`);
+    }
+
+    out.push(`${region.container} { position: relative !important; }`);
+
+    const layer = [
+        `content: '' !important`, `position: absolute !important`,
+        `top: 0`, `left: 0`, `width: 100%`, `height: 100%`,
+        `z-index: 10 !important`, `pointer-events: none !important`,
+        `background-position: center center`, `background-repeat: no-repeat`,
+        `background-size: cover`
+    ];
+    // 深色主题下 screen 混合让图与底色自然融合;浅色主题会发白,故可关
+    if (cfg.blend) layer.push(`mix-blend-mode: screen`);
+
+    if (urls.length === 1) {
+        layer.push(`background-image: url("${urls[0]}")`, `opacity: ${opacity}`);
+        out.push(`${region.container}::after {\n    ${layer.join(';\n    ')};\n}`);
+    } else {
+        const anim = `beautify-carousel-${key}`;
+        const dur = Math.max(1, Math.round((cfg.intervalMs || 8000) * urls.length / 1000));
+        layer.push(`animation: ${anim} ${dur}s linear infinite`);
+        out.push(`${region.container}::after {\n    ${layer.join(';\n    ')};\n}`);
+        out.push(carouselKeyframes(anim, urls, opacity));
+        // 系统要求减少动效时停在第一张,不要闪
+        out.push(`@media (prefers-reduced-motion: reduce) {\n    ${region.container}::after {\n        animation: none !important;\n        background-image: url("${urls[0]}") !important;\n        opacity: ${opacity} !important;\n    }\n}`);
+    }
+    return out.join('\n');
+}
+
 async function reloadCUS() {
     try { await vscode.commands.executeCommand('custom-ui-style.reload'); }
     catch (e) { vscode.window.showWarningMessage('已改配置,但自动 reload 失败,请手动运行 "Custom UI Style: Reload"。'); }
@@ -727,7 +864,10 @@ module.exports = {
     defaultUserDir, resolveUserDir, getUserDir, cusBaseCss, cusDynamicCss,
     toFileUrl, fromFileUrl, isStaleManagedImport, MANAGED_CSS_NAMES,
     fontDirs, fallbackFonts, fontStack, listFonts, currentFontName,
-    setConfig, applicable, platformSkipKeys, warnFailed
+    setConfig, applicable, platformSkipKeys, warnFailed,
+    // 多区域背景 / 轮播
+    REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
+    imageCssUrl, carouselKeyframes, regionCss
 };
 
 function getHtml() {
