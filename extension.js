@@ -390,16 +390,28 @@ function getCodeOpacity() {
 }
 
 // 生成并写入 cus-dynamic.css;用注释标记当前 animMode / bgMode 供 readState 读取
-function writeDynamicCss(animMode, bgMode) {
+// state 可选:bgMode 为 'regions' 时用它生成多区域段,不传则从状态文件读。
+function writeDynamicCss(animMode, bgMode, state) {
     const bgUrl = getChosenImage();
     let out = `/* 由美化控制台动态生成,勿手改 */\n/* ANIM:${animMode} */\n/* BG:${bgMode} */\n\n`;
     // 动画段
     const anim = ANIM_PRESETS[animMode] || {};
     if (Object.keys(anim).length) out += '/* ---- 动画 ---- */\n' + cssFromObj(anim) + '\n\n';
-    // 仅代码区背景段(图转 base64 绕过 CSP;用专属的 codeOpacity)
+    // 仅代码区背景段(旧模式,保留:图转 base64 绕过 CSP;用专属的 codeOpacity)
     if (bgMode === 'codeOnly' && bgUrl) {
         const dataUri = imageToDataUri(bgUrl);
         out += '/* ---- 仅代码区背景 ---- */\n' + cssFromObj(codeOnlyCss(dataUri, getCodeOpacity())) + '\n';
+    }
+    // 多区域段:各区域独立图 / 不透明度 / 轮播
+    if (bgMode === 'regions') {
+        const st = state || readBeautifyState();
+        const parts = [];
+        for (const key of REGION_KEYS) {
+            const cfg = st.regions[key];
+            if (!cfg || !cfg.images.length) continue;
+            parts.push(regionCss(key, { ...cfg, inline: st.inlineImages }));
+        }
+        if (parts.length) out += '/* ---- 多区域背景 ---- */\n' + parts.join('\n\n') + '\n';
     }
     try { fs.writeFileSync(cusDynamicCss(), out); return true; } catch (e) { return false; }
 }
