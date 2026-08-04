@@ -798,7 +798,9 @@ function readState() {
     let bgMode = 'off';
     if (fullUrl) bgMode = 'full';
     else if (dyn.bgModeCss === 'codeOnly') bgMode = 'codeOnly';
+    else if (dyn.bgModeCss === 'regions') bgMode = 'regions';
     const bgUrl = getChosenImage();   // 面板显示用:当前选定的图(独立于模式)
+    const bst = readBeautifyState();  // 多区域配置的唯一来源
     return {
         fontFamily: c.get('editor.fontFamily'),
         fontName: currentFontName(c.get('editor.fontFamily')),
@@ -832,7 +834,12 @@ function readState() {
         themes: listThemes('color'),
         iconThemes: listThemes('icon'),
         productThemes: listThemes('product'),
-        platform: process.platform
+        platform: process.platform,
+        // 多区域 / 自定义 CSS
+        regions: bst.regions,
+        regionMeta: REGION_KEYS.map(k => ({ key: k, label: REGIONS[k].label, defaultOpacity: REGIONS[k].defaultOpacity })),
+        inlineImages: bst.inlineImages,
+        customCssEnabled: isCustomCssEnabled()
     };
 }
 
@@ -1029,11 +1036,84 @@ async function applyBg(mode, noReload) {
         // 仅代码区:清 url,把背景 CSS 写进 dynamic css
         warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
         writeDynamicCss(animMode, 'codeOnly');
+    } else if (mode === 'regions') {
+        // 多区域:清 url,各区域 CSS 由状态文件驱动。模式要落进状态,
+        // 否则下次读状态又回到 off,面板上的选择白点。
+        warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
+        const st = readBeautifyState();
+        st.bgMode = 'regions';
+        st.animMode = animMode;
+        writeBeautifyState(st);
+        writeDynamicCss(animMode, 'regions', st);
     } else {
         warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
+        const st = readBeautifyState();
+        st.bgMode = 'off';
+        writeBeautifyState(st);
         writeDynamicCss(animMode, 'off');
     }
     if (!noReload) await reloadCUS();
+}
+
+// 存状态 → 重写 CSS → 刷新面板 → 标记待重启。多区域的每次改动都走这里。
+function applyRegionState(st, panel) {
+    writeBeautifyState(st);
+    writeDynamicCss(st.animMode, st.bgMode, st);
+    if (panel) panel.webview.postMessage({ type: 'init', state: readState() });
+    markRestart(panel);
+}
+
+// 按开关同步 cus-custom.css 在 imports 里的登记状态
+async function syncCustomCssImport() {
+    const cfg = vscode.workspace.getConfiguration();
+    const url = toFileUrl(cusCustomCss());
+    const imports = (cfg.get('custom-ui-style.external.imports') || []).filter(im => im !== url);
+    // 启用时追加到末尾 —— 顺序决定优先级,用户规则要压过我们生成的
+    if (isCustomCssEnabled()) imports.push(url);
+    await cfg.update('custom-ui-style.external.imports', imports, vscode.ConfigurationTarget.Global);
+}
+
+async function doExportConfig() {
+    const uri = await vscode.window.showSaveDialog({
+        filters: { JSON: ['json'] },
+        saveLabel: '导出',
+        defaultUri: vscode.Uri.file(path.join(os.homedir(), 'beautify-config.json'))
+    });
+    if (!uri) return;
+    try {
+        fs.writeFileSync(uri.fsPath, JSON.stringify(exportConfig(), null, 2));
+        vscode.window.showInformationMessage(`已导出到 ${uri.fsPath}`);
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 导出失败 — ${e.message}`);
+    }
+}
+
+async function doImportConfig(panel) {
+    const uri = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { JSON: ['json'] }, openLabel: '导入' });
+    if (!uri || !uri[0]) return;
+    let raw;
+    try {
+        raw = JSON.parse(fs.readFileSync(uri[0].fsPath, 'utf8'));
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 读取失败 — ${e.message}`);
+        return;
+    }
+    try {
+        const r = await importConfig(raw);
+        if (panel) panel.webview.postMessage({ type: 'init', state: readState() });
+        markRestart(panel);
+        // 逐项交代结果 —— 静默丢弃比报错更让人困惑
+        const notes = [];
+        if (r.missingImages.length) notes.push(`${r.missingImages.length} 张图在本机不存在,已跳过`);
+        if (r.rejected.length) notes.push(`${r.rejected.length} 项不合法已丢弃`);
+        if (r.failedKeys.length) notes.push(`${r.failedKeys.length} 个设置键写入失败`);
+        vscode.window.showInformationMessage(
+            '配置已导入' + (notes.length ? `(${notes.join(';')})` : '') + '。重启后生效。');
+        if (r.rejected.length) console.warn('[美化控制台] 导入时丢弃:', r.rejected.join(', '));
+        if (r.missingImages.length) console.warn('[美化控制台] 缺失图片:', r.missingImages.join(', '));
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 导入失败 — ${e.message}`);
+    }
 }
 
 // 参数键 → VS Code 设置键 映射(原生即时生效类)
@@ -1117,6 +1197,52 @@ async function handleMessage(msg, panel) {
                 panel.webview.postMessage({ type: 'init', state: readState() });
                 markRestart(panel);
             }
+        } else if (msg.type === 'regionAddImage') {
+            const uri = await vscode.window.showOpenDialog({
+                canSelectMany: true,
+                filters: { 图片: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'] }
+            });
+            if (uri && uri.length) {
+                const st = readBeautifyState();
+                const cfg = st.regions[msg.region];
+                if (!cfg) throw new Error(`未知区域 ${msg.region}`);
+                for (const u of uri) {
+                    const dest = path.join(getUserDir(), 'backgrounds', safeImageName(path.basename(u.fsPath)));
+                    fs.mkdirSync(path.dirname(dest), { recursive: true });
+                    fs.copyFileSync(u.fsPath, dest);
+                    if (!cfg.images.includes(dest)) cfg.images.push(dest);
+                }
+                st.bgMode = 'regions';
+                applyRegionState(st, panel);
+            }
+        } else if (msg.type === 'regionClear') {
+            const st = readBeautifyState();
+            if (st.regions[msg.region]) st.regions[msg.region].images = [];
+            applyRegionState(st, panel);
+        } else if (msg.type === 'regionOpacity') {
+            const st = readBeautifyState();
+            if (st.regions[msg.region]) st.regions[msg.region].opacity = msg.value;
+            applyRegionState(st, panel);
+        } else if (msg.type === 'regionInterval') {
+            const st = readBeautifyState();
+            if (st.regions[msg.region]) st.regions[msg.region].intervalMs = msg.value;
+            applyRegionState(st, panel);
+        } else if (msg.type === 'setInlineImages') {
+            const st = readBeautifyState();
+            st.inlineImages = !!msg.value;
+            applyRegionState(st, panel);
+        } else if (msg.type === 'setCustomCssEnabled') {
+            warnFailed(await setConfig([['beautify.customCss.enabled', !!msg.value]]));
+            // 开关改的是 imports 里有没有这一条,所以要重登记
+            await syncCustomCssImport();
+            panel.webview.postMessage({ type: 'init', state: readState() });
+            markRestart(panel);
+        } else if (msg.type === 'openCustomCss') {
+            await openCustomCss();
+        } else if (msg.type === 'exportConfig') {
+            await doExportConfig();
+        } else if (msg.type === 'importConfig') {
+            await doImportConfig(panel);
         } else if (msg.type === 'setRadius') {
             if (setRadius(msg.value)) markRestart(panel);
         } else if (msg.type === 'reload' || msg.type === 'doRestart') {
@@ -1183,7 +1309,7 @@ module.exports = {
     // 多区域背景 / 轮播
     REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
     imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss, safeImageName,
-    isCustomCssEnabled, panicDisableCustomCss,
+    isCustomCssEnabled, panicDisableCustomCss, applyBg, readState,
     // 状态
     STATE_VERSION, stateFile, defaultState, sanitizeState, readBeautifyState, writeBeautifyState,
     migrateLegacyState, ANIM_MODES, BG_MODES,
@@ -1409,11 +1535,34 @@ input[type=range]:active::-webkit-slider-thumb { transform: scale(1.25); }
     <div class="section">
         <h2>背景图 <span class="badge">需重载</span></h2>
         <div class="row"><label>模式<span class="q" tabindex="0" data-tip="背景图铺在哪:全窗口=整个界面都铺 / 仅代码区=只在编辑代码的区域 / 关闭=不要背景图。">?</span></label><div class="ctrl"><div class="seg" id="bgSeg">
-            <button data-v="full">全窗口</button><button data-v="codeOnly">仅代码区</button><button data-v="off">关闭</button>
+            <button data-v="full">全窗口</button><button data-v="codeOnly">仅代码区</button><button data-v="regions">多区域</button><button data-v="off">关闭</button>
         </div></div></div>
         <div class="row"><label>图片<span class="q" tabindex="0" data-tip="选一张图片当背景。选好后会自动复制到安全位置,不怕原图被移动或删除。">?</span></label><div class="ctrl"><button class="ghost" id="btnPick">选择图片…</button></div></div>
         <div class="row"><label>不透明度<span class="q" tabindex="0" data-tip="背景图的浓淡程度。数值越小图越淡、代码越清晰;越大图越明显。">?</span></label><div class="ctrl"><input type="range" id="bgOpacity" min="0.7" max="1" step="0.01"><span class="val" id="bgOpacityV"></span></div></div>
         <div class="hint">改背景会重载窗口</div>
+    </div>
+
+    <div class="section" id="secRegions">
+        <h2>多区域背景 <span class="badge">需重载</span></h2>
+        <div class="hint">编辑器 / 侧栏 / 面板可各设一张或多张图。多张图会按间隔淡入淡出轮播。</div>
+        <div id="regionRows"></div>
+        <div class="row"><label>图片引用方式<span class="q" tabindex="0" data-tip="直接引用=CSS 里只写路径,文件小、加载快(推荐)。内嵌=把图片转成 base64 塞进 CSS,文件会大几十倍,只在直接引用不显示时才用。">?</span></label><div class="ctrl"><div class="seg" id="inlineSeg">
+            <button data-v="url">直接引用</button><button data-v="inline">内嵌 base64</button>
+        </div></div></div>
+    </div>
+
+    <div class="section">
+        <h2>自定义 CSS <span class="badge">需重载</span></h2>
+        <div class="row"><label>启用<span class="q" tabindex="0" data-tip="是否把你写的 CSS 注入界面。写坏了可以关掉,文件内容不会丢。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="customCssOn"><span class="slider-sw"></span></label></div></div>
+        <div class="row"><label>编辑<span class="q" tabindex="0" data-tip="在编辑器里打开 cus-custom.css。本插件只创建它,永不覆盖你写的内容。">?</span></label><div class="ctrl"><button class="ghost" id="btnEditCss">打开 cus-custom.css</button></div></div>
+        <div class="hint" id="panicHint">⚠️ 自定义 CSS 能把整个界面弄不可见（连命令面板也会一起藏掉）。此时按 <b id="panicKey">Cmd+Alt+Shift+F12</b> 可一键关闭它恢复界面 —— 键绑定不依赖界面可见,所以在全黑时依然有效。</div>
+    </div>
+
+    <div class="section">
+        <h2>配置导入导出</h2>
+        <div class="row"><label>导出<span class="q" tabindex="0" data-tip="把整套美化配置存成一个 JSON 文件,可以分享或备份。图片按路径引用,不会把图片本身塞进去。">?</span></label><div class="ctrl"><button class="ghost" id="btnExport">导出配置…</button></div></div>
+        <div class="row"><label>导入<span class="q" tabindex="0" data-tip="读入一个导出过的 JSON。所有值都会先校验,非法项会被丢弃并告诉你。你现有的自定义 CSS 会先备份成 .bak。">?</span></label><div class="ctrl"><button class="ghost" id="btnImport">导入配置…</button></div></div>
+        <div class="hint">导入的图片路径若在本机不存在,会被跳过并列出来。</div>
     </div>
 
     <div class="section">
@@ -1506,6 +1655,61 @@ function render(){
     fillSelect($('iconTheme'), S.iconThemes, S.iconTheme);
     fillSelect($('productIconTheme'), S.productThemes, S.productIconTheme);
     $('radius').value = S.radius || 8; $('radiusV').textContent = (S.radius || 8);
+    renderRegions();
+    // 多区域区块只在该模式下才有意义
+    $('secRegions').style.display = (S.bgMode === 'regions') ? '' : 'none';
+    setSeg('inlineSeg', S.inlineImages ? 'inline' : 'url');
+    $('customCssOn').checked = S.customCssEnabled !== false;
+    $('panicKey').textContent = (S.platform === 'darwin' ? 'Cmd' : 'Ctrl') + '+Alt+Shift+F12';
+}
+
+// 每个区域一行:图片数量 / 添加 / 清空 / 不透明度 / 轮播间隔
+function renderRegions(){
+    const wrap = $('regionRows');
+    if (!wrap) return;
+    const regions = S.regions || {};
+    wrap.innerHTML = '';
+    (S.regionMeta || []).forEach(meta => {
+        const cfg = regions[meta.key] || { images: [], opacity: meta.defaultOpacity, intervalMs: 8000, blend: true };
+        const n = (cfg.images || []).length;
+        const row = document.createElement('div');
+        row.className = 'row';
+        const desc = n === 0 ? '未设置' : (n === 1 ? '1 张' : n + ' 张 · 轮播');
+        row.innerHTML =
+            '<label>' + meta.label + ' <span style="color:var(--muted);font-size:11px">' + desc + '</span></label>' +
+            '<div class="ctrl">' +
+            '<input type="range" min="0.03" max="0.8" step="0.01" data-op="' + meta.key + '" value="' + cfg.opacity + '">' +
+            '<span class="val" data-opv="' + meta.key + '">' + cfg.opacity + '</span>' +
+            '<button class="ghost" data-add="' + meta.key + '">添加图片…</button>' +
+            '<button class="ghost" data-clear="' + meta.key + '"' + (n ? '' : ' disabled') + '>清空</button>' +
+            '</div>';
+        wrap.appendChild(row);
+        // 两张图以上才显示间隔滑块 —— 单图没有轮播可言
+        if (n > 1) {
+            const ir = document.createElement('div');
+            ir.className = 'row';
+            const secs = Math.round((cfg.intervalMs || 8000) / 1000);
+            ir.innerHTML =
+                '<label style="padding-left:14px;color:var(--muted)">↳ 每张停留</label>' +
+                '<div class="ctrl"><input type="range" min="2" max="120" step="1" data-iv="' + meta.key + '" value="' + secs + '">' +
+                '<span class="val" data-ivv="' + meta.key + '">' + secs + 's</span></div>';
+            wrap.appendChild(ir);
+        }
+    });
+    wrap.querySelectorAll('[data-add]').forEach(b => b.addEventListener('click', () =>
+        post({ type: 'regionAddImage', region: b.dataset.add })));
+    wrap.querySelectorAll('[data-clear]').forEach(b => b.addEventListener('click', () =>
+        post({ type: 'regionClear', region: b.dataset.clear })));
+    wrap.querySelectorAll('[data-op]').forEach(el => {
+        const lbl = wrap.querySelector('[data-opv="' + el.dataset.op + '"]');
+        el.addEventListener('input', () => { lbl.textContent = el.value; });
+        el.addEventListener('change', () => post({ type: 'regionOpacity', region: el.dataset.op, value: parseFloat(el.value) }));
+    });
+    wrap.querySelectorAll('[data-iv]').forEach(el => {
+        const lbl = wrap.querySelector('[data-ivv="' + el.dataset.iv + '"]');
+        el.addEventListener('input', () => { lbl.textContent = el.value + 's'; });
+        el.addEventListener('change', () => post({ type: 'regionInterval', region: el.dataset.iv, value: parseInt(el.value, 10) * 1000 }));
+    });
 }
 // —— 原生即时生效类 ——
 function bindNative(id, key, ev){
@@ -1572,7 +1776,14 @@ $('btnPick').addEventListener('click', ()=> post({type:'pickImage'}));
 $('btnReload').addEventListener('click', ()=> post({type:'reload'}));
 $('btnRefresh').addEventListener('click', ()=> post({type:'refresh'}));
 $('btnRestore').addEventListener('click', ()=>{ vscode.postMessage({type:'restore'}); showToast('正在恢复默认…'); });
-$('btnDoRestart').addEventListener('click', ()=>{ vscode.postMessage({type:'doRestart'}); });</script>
+$('btnDoRestart').addEventListener('click', ()=>{ vscode.postMessage({type:'doRestart'}); });
+document.querySelectorAll('#inlineSeg button').forEach(b=>b.addEventListener('click',()=>{
+    setSeg('inlineSeg', b.dataset.v); post({type:'setInlineImages', value: b.dataset.v === 'inline'});
+}));
+$('customCssOn').addEventListener('change', ()=> post({type:'setCustomCssEnabled', value: $('customCssOn').checked}));
+$('btnEditCss').addEventListener('click', ()=> vscode.postMessage({type:'openCustomCss'}));
+$('btnExport').addEventListener('click', ()=>{ vscode.postMessage({type:'exportConfig'}); showToast('正在导出…'); });
+$('btnImport').addEventListener('click', ()=> vscode.postMessage({type:'importConfig'}));</script>
 </body>
 </html>`;
 }
