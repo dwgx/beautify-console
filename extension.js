@@ -413,6 +413,107 @@ function readDynamicModes() {
     } catch (e) { return { animMode: 'default', bgModeCss: 'off' }; }
 }
 
+// ============================================================
+// 状态文件 —— 多区域 / 轮播的配置装不进注释标记,改用 JSON
+// 旧状态(单图 .beautify-bg-image + cus-dynamic.css 的 ANIM:/BG: 注释)仍然
+// 是唯一来源直到这里迁移一次;迁移后依旧继续写那两个注释,让 readDynamicModes
+// 和任何还在读旧格式的路径不受影响。
+// ============================================================
+const STATE_VERSION = 1;
+const stateFile = () => path.join(getUserDir(), 'beautify-state.json');
+
+function defaultRegionCfg(key) {
+    return { images: [], opacity: REGIONS[key].defaultOpacity, intervalMs: 8000, blend: true };
+}
+
+function defaultState() {
+    const regions = {};
+    for (const k of REGION_KEYS) regions[k] = defaultRegionCfg(k);
+    return { version: STATE_VERSION, animMode: 'default', bgMode: 'off', regions, inlineImages: false };
+}
+
+// 从旧格式迁移:单张图归到 editor 区域,模式沿用注释标记
+function migrateLegacyState() {
+    const st = defaultState();
+    const modes = readDynamicModes();
+    st.animMode = modes.animMode;
+    const legacyImg = getChosenImage();
+    if (legacyImg) {
+        const abs = fromFileUrl(legacyImg);
+        if (modes.bgModeCss === 'codeOnly') {
+            st.bgMode = 'codeOnly';
+            st.regions.editor.images = [abs];
+            st.regions.editor.opacity = getCodeOpacity();
+        } else if (vscode.workspace.getConfiguration().get('custom-ui-style.background.url')) {
+            st.bgMode = 'full';
+        }
+    }
+    return st;
+}
+
+// 校验并规范化任意来源的状态对象(状态文件被手改、或从别人那儿导入的配置)。
+// 只接受白名单内的键与合法取值,其余一律丢弃 —— 这些值会被写进注入的 CSS,
+// 不能信。返回 { state, rejected } 便于向用户交代哪些项被丢了。
+const ANIM_MODES = ['default', 'smooth', 'bounce', 'fancy', 'off'];
+const BG_MODES = ['off', 'full', 'codeOnly', 'regions'];
+
+function sanitizeState(raw) {
+    const st = defaultState();
+    const rejected = [];
+    if (!raw || typeof raw !== 'object') return { state: st, rejected: ['整个文件不是对象'] };
+
+    if (ANIM_MODES.includes(raw.animMode)) st.animMode = raw.animMode;
+    else if (raw.animMode !== undefined) rejected.push(`animMode=${JSON.stringify(raw.animMode)}`);
+
+    if (BG_MODES.includes(raw.bgMode)) st.bgMode = raw.bgMode;
+    else if (raw.bgMode !== undefined) rejected.push(`bgMode=${JSON.stringify(raw.bgMode)}`);
+
+    st.inlineImages = raw.inlineImages === true;
+
+    const rawRegions = (raw.regions && typeof raw.regions === 'object') ? raw.regions : {};
+    for (const k of REGION_KEYS) {
+        const src = rawRegions[k];
+        if (!src || typeof src !== 'object') continue;
+        const dst = st.regions[k];
+        // 图片路径:必须是绝对路径字符串。相对路径会相对 workbench 解析,指向
+        // app bundle 内部,既无效也不该允许。
+        if (Array.isArray(src.images)) {
+            for (const p of src.images) {
+                if (typeof p === 'string' && p && path.isAbsolute(p)) dst.images.push(p);
+                else rejected.push(`${k}.images 里的 ${JSON.stringify(p)}`);
+            }
+        }
+        if (typeof src.opacity === 'number' && src.opacity >= 0 && src.opacity <= 1) dst.opacity = src.opacity;
+        else if (src.opacity !== undefined) rejected.push(`${k}.opacity=${JSON.stringify(src.opacity)}`);
+        // 间隔下限 1s:再短会让 CSS 动画疯狂重绘
+        if (typeof src.intervalMs === 'number' && src.intervalMs >= 1000 && src.intervalMs <= 3600000) dst.intervalMs = src.intervalMs;
+        else if (src.intervalMs !== undefined) rejected.push(`${k}.intervalMs=${JSON.stringify(src.intervalMs)}`);
+        dst.blend = src.blend !== false;
+    }
+    return { state: st, rejected };
+}
+
+function readBeautifyState() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(stateFile(), 'utf8'));
+        return sanitizeState(raw).state;
+    } catch (e) {
+        // 首次运行 / 文件损坏 → 从旧格式迁移一次
+        return migrateLegacyState();
+    }
+}
+
+function writeBeautifyState(st) {
+    try {
+        fs.mkdirSync(getUserDir(), { recursive: true });
+        fs.writeFileSync(stateFile(), JSON.stringify(st, null, 2));
+        return true;
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 状态保存失败 — ${e.message}`);
+        return false;
+    }
+}
+
 // 常见编程字体候选(展示名 → 文件名关键字列表,用于检测是否已装)
 // 同一字体在不同系统的文件名可能不同(如 SF Mono 有 SFMono-Regular / SFNSMono 两种)
 const CODING_FONTS = [
@@ -880,7 +981,10 @@ module.exports = {
     setConfig, applicable, platformSkipKeys, warnFailed,
     // 多区域背景 / 轮播
     REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
-    imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss
+    imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss,
+    // 状态
+    STATE_VERSION, stateFile, defaultState, sanitizeState, readBeautifyState, writeBeautifyState,
+    migrateLegacyState, ANIM_MODES, BG_MODES
 };
 
 function getHtml() {

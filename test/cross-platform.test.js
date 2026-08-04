@@ -223,6 +223,36 @@ test('regionCss 单图不生成动画,多图才生成', () => {
     }
 });
 
+test('sanitizeState 丢弃一切非法输入(导入的配置文件不可信)', () => {
+    const { state, rejected } = ext.sanitizeState({
+        version: 99, animMode: '../../etc/passwd', bgMode: 'regions', inlineImages: 'yes',
+        regions: {
+            editor: { images: ['/ok/a.png', 'relative.png', 42, "');}body{display:none}"], opacity: 5, intervalMs: 1 },
+            sidebar: { images: ['/ok/b.jpg'], opacity: 0.3, intervalMs: 6000, blend: false },
+            evil: { images: ['/x.png'] }
+        }
+    });
+    // 只留绝对路径 —— 相对路径会相对 workbench 解析,注入片段直接被挡在门外
+    assert.deepStrictEqual(state.regions.editor.images, ['/ok/a.png']);
+    assert.strictEqual(state.animMode, 'default', '非法 animMode 必须回落');
+    assert.strictEqual(state.regions.editor.opacity, 0.22, '越界 opacity 必须回落');
+    assert.strictEqual(state.regions.editor.intervalMs, 8000, '越界间隔必须回落');
+    assert.strictEqual(state.inlineImages, false, "字符串 'yes' 不是 true");
+    assert.strictEqual(state.version, ext.STATE_VERSION, '版本号由本插件写,不采信输入');
+    assert.ok(!('evil' in state.regions), '未知区域必须丢弃');
+    // 合法值原样保留
+    assert.deepStrictEqual(state.regions.sidebar, { images: ['/ok/b.jpg'], opacity: 0.3, intervalMs: 6000, blend: false });
+    assert.ok(rejected.length >= 6, `应记录被丢弃项,实际 ${rejected.length}`);
+});
+
+test('sanitizeState 对垃圾输入不抛异常', () => {
+    for (const junk of [null, undefined, 42, 'str', [], { regions: 'nope' }, { regions: { editor: null } }]) {
+        const r = ext.sanitizeState(junk);
+        assert.strictEqual(r.state.version, ext.STATE_VERSION);
+        assert.ok(Array.isArray(r.state.regions.editor.images));
+    }
+});
+
 test('imageCssUrl 白名单外的扩展名退回 base64 内联', () => {
     assert.match(ext.imageCssUrl('/x/a.png'), /^vscode-file:\/\/vscode-app\//);
     // .tiff 不在 Electron 的 validExtensions 里,vscode-file 会被拒
