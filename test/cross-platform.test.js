@@ -244,6 +244,17 @@ test('regionCss 换图帧的 opacity 必须为 0(否则轮播会硬切)', () => 
     assert.match(css, /prefers-reduced-motion/);
 });
 
+test('regionCss 的图层声明全部带 !important(级联顺序对我们不利)', () => {
+    // Custom UI Style 把 external.css 注入在 workbench.desktop.main.css 之前
+    // (本机 workbench.html 核对:1313 vs 1415),同优先级下 VS Code 一律胜出。
+    // 且 VS Code 自己也在 workbench 元素上用 ::after,将来给这些容器加一条就会盖掉我们。
+    const css = ext.regionCss('editor', { images: ['/a.png', '/b.png'], opacity: 0.22, blend: true });
+    const block = css.match(/::after \{([\s\S]*?)\n\}/)[1];
+    for (const decl of block.split(';').map(s => s.trim()).filter(Boolean)) {
+        assert.ok(decl.includes('!important'), `图层声明缺 !important: ${decl}`);
+    }
+});
+
 test('regionCss 单图不生成动画,多图才生成', () => {
     const one = ext.regionCss('panel', { images: ['/a.png'], opacity: 0.18 });
     assert.ok(!/@keyframes/.test(one), '单图不应有 keyframes');

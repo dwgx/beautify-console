@@ -279,23 +279,29 @@ function regionCss(key, cfg) {
 
     out.push(`${region.container} { position: relative !important; }`);
 
+    // 每条都带 !important:Custom UI Style 把 external.css 注入在
+    // workbench.desktop.main.css【之前】(已在本机 workbench.html 核对:1313 vs 1415),
+    // 所以同优先级下 VS Code 一律胜出。VS Code 自己也在 workbench 元素上用 ::after
+    // (如 .title.title-border-bottom:after),将来它给我们这些容器加一条就会盖掉我们。
     const layer = [
         `content: '' !important`, `position: absolute !important`,
-        `top: 0`, `left: 0`, `width: 100%`, `height: 100%`,
+        `top: 0 !important`, `left: 0 !important`,
+        `width: 100% !important`, `height: 100% !important`,
         `z-index: 10 !important`, `pointer-events: none !important`,
-        `background-position: center center`, `background-repeat: no-repeat`,
-        `background-size: cover`
+        `background-position: center center !important`,
+        `background-repeat: no-repeat !important`,
+        `background-size: cover !important`
     ];
     // 深色主题下 screen 混合让图与底色自然融合;浅色主题会发白,故可关
-    if (cfg.blend) layer.push(`mix-blend-mode: screen`);
+    if (cfg.blend) layer.push(`mix-blend-mode: screen !important`);
 
     if (urls.length === 1) {
-        layer.push(`background-image: url("${urls[0]}")`, `opacity: ${opacity}`);
+        layer.push(`background-image: url("${urls[0]}") !important`, `opacity: ${opacity} !important`);
         out.push(`${region.container}::after {\n    ${layer.join(';\n    ')};\n}`);
     } else {
         const anim = `beautify-carousel-${key}`;
         const dur = Math.max(1, Math.round((cfg.intervalMs || 8000) * urls.length / 1000));
-        layer.push(`animation: ${anim} ${dur}s linear infinite`);
+        layer.push(`animation: ${anim} ${dur}s linear infinite !important`);
         out.push(`${region.container}::after {\n    ${layer.join(';\n    ')};\n}`);
         out.push(carouselKeyframes(anim, urls, opacity));
         // 系统要求减少动效时停在第一张,不要闪
