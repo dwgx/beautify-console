@@ -176,6 +176,28 @@ test('setConfig 单键写入失败不中断整批(未注册键不再吃掉后续
     }
 });
 
+test('首次安装标记在 reload 之前写(否则每次启动都重跑默认值)', async () => {
+    const fs = require('node:fs');
+    const vscodeStub = require('./vscode-stub.js');
+    const realExec = vscodeStub.commands.executeCommand;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-init-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        // applyJetBrainsDefaults 末尾会 reloadCUS,macOS 上那是整个应用退出重开。
+        // 标记若写在它之后就可能永远写不成,于是每次启动都重跑默认值,
+        // 把用户后来的改动持续覆盖回去。这里模拟进程被带走:命令永不 resolve。
+        vscodeStub.commands.executeCommand = () => new Promise(() => {});
+        ext.activate({ subscriptions: [], globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        await new Promise(r => setTimeout(r, 120));
+        assert.ok(fs.existsSync(path.join(userDir, '.beautify-init-done')),
+            '标记必须在 reload 之前落盘,否则会陷入每次启动重跑的循环');
+    } finally {
+        vscodeStub.commands.executeCommand = realExec;
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('从 1.0.5 旧格式迁移不丢配置', () => {
     const fs = require('node:fs');
     const vscodeStub = require('./vscode-stub.js');

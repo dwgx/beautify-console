@@ -619,6 +619,9 @@ function sanitizeState(raw) {
     return { state: st, rejected };
 }
 
+// 自举的完成信号。命令与面板消息都要先等它,否则会与首次安装的默认值写入打架。
+let bootstrapDone = Promise.resolve();
+
 // 已经就损坏文件提示过没有 —— 每次读都弹一次会刷屏
 let corruptStateReported = false;
 
@@ -1033,10 +1036,14 @@ async function bootstrap() {
             await cfg.update('custom-ui-style.external.loadStrategy', 'refetch', vscode.ConfigurationTarget.Global);
             await cfg.update('custom-ui-style.reloadWithoutPrompting', true, vscode.ConfigurationTarget.Global);
         }
-        // 首次安装:自动应用 JetBrains 默认参数
+        // 首次安装:自动应用 JetBrains 默认参数。
+        // 标记必须在应用默认值【之前】写:applyJetBrainsDefaults 末尾会 reloadCUS,
+        // 而 macOS 上那是整个应用退出重开 —— 标记写在它之后就可能永远写不成,
+        // 于是每次启动都重跑一遍默认值,把用户后来的改动持续覆盖回去。
+        // 宁可漏应用一次默认值,也不能陷入这种循环。
         if (!fs.existsSync(initDoneFile())) {
-            await applyJetBrainsDefaults();
             fs.writeFileSync(initDoneFile(), new Date().toISOString());
+            await applyJetBrainsDefaults();
         }
     } catch (e) {
         // 自举失败会导致整个面板无声失效,必须让用户看见原因
@@ -1073,13 +1080,19 @@ async function applyJetBrainsDefaults() {
     setRadius(8);
     await setConfig([['custom-ui-style.background.opacity', 0.92]]);
     writeDynamicCss('default', 'off');
-    await reloadCUS();
+    // 不 await:reloadCUS 在 macOS 上会退出并重开应用,它的 promise 可能永远不
+    // resolve。而 bootstrapDone 要用来给面板消息放行,把 reload 算进去的话
+    // 一旦它挂住,整个面板就无响应且毫无提示。写入已完成,reload 交出去即可。
+    reloadCUS();
 }
 
 function activate(context) {
     let panel = null;
     resolveUserDir(context);   // 必须在 bootstrap 之前:所有文件路径都依赖它
-    bootstrap();
+    // 不 await:activate 不该被 22 次设置写入拖住。但命令必须等它跑完再动手 ——
+    // 首次安装时 applyJetBrainsDefaults 正在逐条写默认值,用户此刻拖字号会先被
+    // 提示「已实时应用」,随后被默认值覆盖回去。
+    bootstrapDone = bootstrap();
 
     context.subscriptions.push(vscode.commands.registerCommand('beautify.openPanel', () => {
         if (panel) { panel.dispose(); panel = null; } // 强制重建,保证最新 HTML
@@ -1157,30 +1170,32 @@ function setChosenImage(url) {
 // 背景模式应用 —— 全窗口用 background.url;仅代码区写进 cus-dynamic.css;动画保持
 async function applyBg(mode, noReload) {
     const bgUrl = getChosenImage();
-    const animMode = readDynamicModes().animMode;
+    // 动画档位必须在 await 之后再读:在等待设置写入的窗口里用户若改了动画档位,
+    // 用开头读到的旧值重写 CSS 会把那次改动抹掉(状态文件与 CSS 标记还会不一致)。
+    const animMode = () => readDynamicModes().animMode;
     if (mode === 'full') {
         // 全窗口:CUS 内建背景显示;dynamic css 只留动画(bg=off)
         warnFailed(await setConfig([['custom-ui-style.background.url', bgUrl]]));
-        writeDynamicCss(animMode, 'off');
+        writeDynamicCss(animMode(), 'off');
     } else if (mode === 'codeOnly') {
         // 仅代码区:清 url,把背景 CSS 写进 dynamic css
         warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
-        writeDynamicCss(animMode, 'codeOnly');
+        writeDynamicCss(animMode(), 'codeOnly');
     } else if (mode === 'regions') {
         // 多区域:清 url,各区域 CSS 由状态文件驱动。模式要落进状态,
         // 否则下次读状态又回到 off,面板上的选择白点。
         warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
         const st = readBeautifyState();
         st.bgMode = 'regions';
-        st.animMode = animMode;
+        st.animMode = animMode();
         writeBeautifyState(st);
-        writeDynamicCss(animMode, 'regions', st);
+        writeDynamicCss(st.animMode, 'regions', st);
     } else {
         warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
         const st = readBeautifyState();
         st.bgMode = 'off';
         writeBeautifyState(st);
-        writeDynamicCss(animMode, 'off');
+        writeDynamicCss(animMode(), 'off');
     }
     if (!noReload) await reloadCUS();
 }
@@ -1291,6 +1306,9 @@ async function promptRestart() {
 
 async function handleMessage(msg, panel) {
     try {
+        // 首次安装时自举正在逐条写默认值,插队写入会被它随后覆盖 ——
+        // 用户会先看到「已实时应用」,再看到值被改回去。
+        await bootstrapDone;
         if (msg.type === 'setFont') {
             // 选字体名 → 组装带平台兜底链的 fontFamily(编辑器+终端一起)
             const ff = fontStack(msg.value);
