@@ -338,6 +338,56 @@ test('regionCss 换图帧的 opacity 必须为 0(否则轮播会硬切)', () => 
     assert.match(css, /prefers-reduced-motion/);
 });
 
+test('regionCss 在整个输入空间产出合法 CSS', () => {
+    // 结构检查:花括号配平、url() 始终带引号且内部无裸双引号、
+    // 关键帧百分比单调不越界不重复、换图帧 opacity 必为 0。
+    // 注意引号内的 ( ) ' 在 CSS 里合法,不能当成错误。
+    function check(css) {
+        const errs = [];
+        let depth = 0;
+        for (const ch of css) {
+            if (ch === '{') depth++;
+            else if (ch === '}' && --depth < 0) { errs.push('} 多余'); break; }
+        }
+        if (depth !== 0) errs.push(`花括号不配平(剩 ${depth})`);
+        for (const m of css.matchAll(/url\(\s*([^"\s])/g)) errs.push(`url() 未带引号: ${m[1]}`);
+        for (const kf of css.matchAll(/@keyframes\s+([\w-]+)\s*\{([\s\S]*?)\n\}/g)) {
+            const pcts = [...kf[2].matchAll(/([\d.]+)%/g)].map(x => parseFloat(x[1]));
+            if (!pcts.length) errs.push(`${kf[1]}: 无关键帧`);
+            for (const p of pcts) if (p < 0 || p > 100) errs.push(`${kf[1]}: 越界 ${p}`);
+            for (let i = 1; i < pcts.length; i++) if (pcts[i] < pcts[i - 1]) errs.push(`${kf[1]}: 不单调`);
+            if (new Set(pcts).size !== pcts.length) errs.push(`${kf[1]}: 百分比重复`);
+            const fr = [...kf[2].matchAll(/([\d.]+)% \{ background-image: url\("([^"]+)"\); opacity: ([\d.]+); \}/g)]
+                .map(m => ({ pct: +m[1], img: m[2], op: +m[3] }));
+            for (let i = 1; i < fr.length; i++) {
+                if (fr[i].img !== fr[i - 1].img && fr[i].op !== 0) errs.push(`${kf[1]}: ${fr[i].pct}% 换图但 opacity=${fr[i].op}`);
+            }
+        }
+        return errs;
+    }
+
+    let cases = 0;
+    for (const key of ext.REGION_KEYS) {
+        for (const n of [0, 1, 2, 3, 5, 8, 20]) {
+            for (const op of [0, 0.03, 0.22, 1]) {
+                for (const iv of [1000, 8000, 3600000]) {
+                    const images = Array.from({ length: n }, (_, i) => `/pics/img${i}.png`);
+                    const css = ext.regionCss(key, { images, opacity: op, intervalMs: iv, blend: n % 2 === 0 });
+                    cases++;
+                    if (n === 0) { assert.strictEqual(css, '', '无图应产出空串'); continue; }
+                    assert.deepStrictEqual(check(css), [], `${key} n=${n} op=${op} iv=${iv}`);
+                }
+            }
+        }
+    }
+    assert.ok(cases > 200, `组合数应可观,实际 ${cases}`);
+
+    // 路径含括号与单引号:CSS 引号内合法,不该被破坏或转义掉
+    const weird = ext.regionCss('editor', { images: ["/pics/a b(c)'d.png"], opacity: 0.22 });
+    assert.deepStrictEqual(check(weird), []);
+    assert.match(weird, /url\("vscode-file:\/\/vscode-app\/pics\/a%20b\(c\)'d\.png"\)/);
+});
+
 test('regionCss 的图层声明全部带 !important(级联顺序对我们不利)', () => {
     // Custom UI Style 把 external.css 注入在 workbench.desktop.main.css 之前
     // (本机 workbench.html 核对:1313 vs 1415),同优先级下 VS Code 一律胜出。
