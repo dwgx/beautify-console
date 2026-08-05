@@ -176,6 +176,67 @@ test('setConfig 单键写入失败不中断整批(未注册键不再吃掉后续
     }
 });
 
+test('改动画档位不得抹掉多区域背景', async () => {
+    const fs = require('node:fs');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-anim-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        const img = path.join(tmp, 'bg.png');
+        fs.writeFileSync(img, 'x');
+
+        const st = ext.readBeautifyState();
+        st.bgMode = 'regions';
+        st.regions.editor.images = [img];
+        ext.writeBeautifyState(st);
+        ext.writeDynamicCss('default', 'regions', st);
+
+        const dynPath = path.join(userDir, 'cus-dynamic.css');
+        assert.match(fs.readFileSync(dynPath, 'utf8'), /editor-instance::after/, '前置条件:图层应存在');
+
+        // 只改动画,背景模式必须原样保留。这里曾把非 codeOnly 折成 off,
+        // 一次改档位就抹掉所有区域图层,而状态文件仍记着 regions。
+        const panel = { webview: { postMessage() {} } };
+        await ext.handleMessage({ type: 'setAnim', value: 'fancy' }, panel);
+
+        const css = fs.readFileSync(dynPath, 'utf8');
+        assert.match(css, /BG:regions/, '背景模式必须保持 regions');
+        assert.match(css, /ANIM:fancy/, '动画档位应已改为 fancy');
+        assert.match(css, /editor-instance::after/, '区域图层不得被抹掉');
+        assert.strictEqual(ext.readBeautifyState().bgMode, 'regions');
+        assert.strictEqual(ext.readState().bgMode, 'regions', 'CSS 标记与状态文件必须一致');
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('多区域模式下不透明度滑块用低量程,且改的是各区域', () => {
+    const fs = require('node:fs');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-op-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        const img = path.join(tmp, 'bg.png');
+        fs.writeFileSync(img, 'x');
+        const st = ext.readBeautifyState();
+        st.bgMode = 'regions';
+        st.regions.editor.images = [img];
+        st.regions.editor.opacity = 0.22;
+        ext.writeBeautifyState(st);
+        ext.writeDynamicCss('default', 'regions', st);
+
+        const s = ext.readState();
+        // 全窗口量程是 0.7~1,若这里报 false,滑块会把区域强推到 0.7 以上糊掉代码
+        assert.strictEqual(s.lowOpacityMode, true, '多区域必须用低量程');
+        assert.ok(s.bgOpacity <= 0.8, `应报区域真实值,实际 ${s.bgOpacity}`);
+        assert.strictEqual(s.bgOpacity, 0.22);
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('紧急关闭自定义 CSS:摘掉 import 但保留文件内容', async () => {
     const fs = require('node:fs');
     const vscodeStub = require('./vscode-stub.js');

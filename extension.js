@@ -825,8 +825,12 @@ function readState() {
         bgMode,
         bgUrl,
         // 按模式返回对应透明度:全窗口用 background.opacity(0.7~1),仅代码区用 codeOpacity(0.05~0.6)
-        bgOpacity: bgMode === 'codeOnly' ? getCodeOpacity() : (c.get('custom-ui-style.background.opacity') || 0.92),
-        codeMode: bgMode === 'codeOnly',
+        // 全窗口用 CUS 的 background.opacity(0.7~1);仅代码区与多区域是叠在
+        // 内容上的图层,取值低得多(0.05~0.8),滑块范围必须跟着换。
+        bgOpacity: bgMode === 'codeOnly' ? getCodeOpacity()
+            : bgMode === 'regions' ? Math.max(...REGION_KEYS.map(k => bst.regions[k].opacity))
+            : (c.get('custom-ui-style.background.opacity') || 0.92),
+        lowOpacityMode: bgMode === 'codeOnly' || bgMode === 'regions',
         radius: getRadius(),
         colorTheme: c.get('workbench.colorTheme'),
         iconTheme: c.get('workbench.iconTheme'),
@@ -1162,9 +1166,14 @@ async function handleMessage(msg, panel) {
             if (msg.key === 'paddingTop') warnFailed(await setConfig([['editor.padding.top', msg.value], ['editor.padding.bottom', msg.value]]));
             // 原生参数即时生效,无需重启
         } else if (msg.type === 'setAnim') {
-            // 动画写进 cus-dynamic.css(保持当前背景模式)
+            // 动画写进 cus-dynamic.css,背景模式必须原样保持。
+            // 这里曾把「非 codeOnly」一律折成 off,于是多区域模式下改一次动画档位
+            // 就把所有区域图层抹掉,而状态文件里还记着 regions —— 两边不一致。
+            const st = readBeautifyState();
             const bgm = readState().bgMode;
-            writeDynamicCss(msg.value, bgm === 'codeOnly' ? 'codeOnly' : 'off');
+            st.animMode = msg.value;
+            writeBeautifyState(st);
+            writeDynamicCss(msg.value, bgm, st);
             markRestart(panel);
         } else if (msg.type === 'setBg') {
             await applyBg(msg.value, true);
@@ -1176,6 +1185,13 @@ async function handleMessage(msg, panel) {
                 // 仅代码区:写专属 codeOpacity,重写 dynamic css
                 warnFailed(await setConfig([['beautify.codeOpacity', msg.value]]));
                 writeDynamicCss(st.animMode, 'codeOnly');
+            } else if (st.bgMode === 'regions') {
+                // 多区域:全窗口的 background.opacity 在这个模式下无效,
+                // 这个总滑块改的是各区域的不透明度(区块里还能逐个微调)。
+                const bst = readBeautifyState();
+                for (const key of REGION_KEYS) bst.regions[key].opacity = msg.value;
+                applyRegionState(bst, panel);
+                return;
             } else {
                 // 全窗口:写 CUS 内建 background.opacity
                 warnFailed(await setConfig([['custom-ui-style.background.opacity', msg.value]]));
@@ -1309,7 +1325,7 @@ module.exports = {
     // 多区域背景 / 轮播
     REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
     imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss, safeImageName,
-    isCustomCssEnabled, panicDisableCustomCss, applyBg, readState,
+    isCustomCssEnabled, panicDisableCustomCss, applyBg, readState, handleMessage,
     // 状态
     STATE_VERSION, stateFile, defaultState, sanitizeState, readBeautifyState, writeBeautifyState,
     migrateLegacyState, ANIM_MODES, BG_MODES,
@@ -1646,9 +1662,9 @@ function render(){
     setSeg('bgSeg', S.bgMode || 'off');
     // 不透明度滑块:按模式切换范围(仅代码区 0.05~0.6 更淡,全窗口 0.7~1)
     const opEl = $('bgOpacity');
-    if (S.codeMode) { opEl.min = '0.05'; opEl.max = '0.6'; opEl.step = '0.01'; }
+    if (S.lowOpacityMode) { opEl.min = '0.03'; opEl.max = '0.8'; opEl.step = '0.01'; }
     else { opEl.min = '0.7'; opEl.max = '1'; opEl.step = '0.01'; }
-    const defOp = S.codeMode ? 0.22 : 0.92;
+    const defOp = S.lowOpacityMode ? 0.22 : 0.92;
     opEl.value = (typeof S.bgOpacity === 'number' ? S.bgOpacity : defOp);
     $('bgOpacityV').textContent = opEl.value;
     fillSelect($('colorTheme'), S.themes, S.colorTheme);
