@@ -58,13 +58,21 @@ test('resolveUserDir 在 globalStorageUri 形状异常时回退到平台默认�
     });
 });
 
-test('toFileUrl 生成的 URL 能被 fromFileUrl 原样还原(含空格路径)', () => {
+test('toFileUrl 生成的 URL 能被 fromFileUrl 还原到同一文件(含空格路径)', () => {
     const p = path.join(os.homedir(), 'Library/Application Support/Code/User/cus-base.css');
     const url = ext.toFileUrl(p);
     assert.ok(url.startsWith('file:///'), `期望三斜杠 file URL,实际 ${url}`);
     assert.ok(!url.startsWith('file:////'), '不应出现四斜杠(旧 bug)');
     assert.ok(url.includes('%20'), '空格应被转义');
-    assert.strictEqual(ext.fromFileUrl(url), p);
+    // 断言「指向同一文件」而不是字节相等:真实 VS Code 的 Uri.parse 会把
+    // Windows 盘符小写(file:///C:/x → c:\x),字节比较在 Windows 宿主上必然失败,
+    // 而本套件从未在 Windows 上跑过。所有 fromFileUrl 的消费者要的都是
+    // basename / dirname / existsSync,不是原始字符串。
+    const back = ext.fromFileUrl(url);
+    assert.strictEqual(path.basename(back), path.basename(p));
+    assert.strictEqual(path.basename(path.dirname(back)), path.basename(path.dirname(p)));
+    assert.strictEqual(back.toLowerCase().replace(/\\/g, '/'), p.toLowerCase().replace(/\\/g, '/'),
+        '大小写与分隔符归一化后应指向同一路径');
 });
 
 test('fromFileUrl 兼容历史遗留的四斜杠格式', () => {
@@ -502,7 +510,9 @@ test('sanitizeState 丢弃一切非法输入(导入的配置文件不可信)', (
             evil: { images: ['/x.png'] }
         }
     });
-    // 只留绝对路径 —— 相对路径会相对 workbench 解析,注入片段直接被挡在门外
+    // 只留绝对路径。注意这一条挡住注入载荷是因为它恰好是相对路径,
+    // 不是因为识别出了注入 —— 真正挡住注入的是 toWorkbenchUrl 的 encodeURI
+    // 与 dataUriMime 的白名单,由另外两条用例负责。
     assert.deepStrictEqual(state.regions.editor.images, ['/ok/a.png']);
     assert.strictEqual(state.animMode, 'default', '非法 animMode 必须回落');
     assert.strictEqual(state.regions.editor.opacity, 0.22, '越界 opacity 必须回落');
@@ -811,11 +821,31 @@ test('内嵌模式对超限图片设上限(否则 CSS 会涨到上百 MB)', () =
 });
 
 test('imageCssUrl 白名单外的扩展名退回 base64 内联', () => {
-    assert.match(ext.imageCssUrl('/x/a.png'), /^vscode-file:\/\/vscode-app\//);
-    // .tiff 不在 Electron 的 validExtensions 里,vscode-file 会被拒
-    assert.ok(!ext.imageCssUrl('/x/a.tiff').startsWith('vscode-file:'), 'tiff 不该走 vscode-file');
-    // 强制内联开关
-    assert.ok(!ext.imageCssUrl('/x/a.png', true).startsWith('vscode-file:'), 'inline=true 应走 base64 路径');
+    const fs = require('node:fs');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-url-'));
+    try {
+        // 必须用真实存在的文件。此前这条用的是 /x/a.tiff 这种不存在的路径,
+        // imageToDataUri 在 existsSync 处就返回原样的 file:// URL,断言只检查了
+        // 「不是 vscode-file」就通过 —— 从未真正见到 data: URI。把
+        // imageToDataUri 改成 return '' 也照样绿。而它放行的 file:// 恰恰是
+        // workbench CSP 会拒绝加载的东西,等于给静默失效发了通行证。
+        const png = path.join(tmp, 'a.png');
+        const tiff = path.join(tmp, 'a.tiff');
+        fs.writeFileSync(png, 'x');
+        fs.writeFileSync(tiff, 'x');
+
+        assert.match(ext.imageCssUrl(png), /^vscode-file:\/\/vscode-app\//);
+        // .tiff 不在 Electron 的 validExtensions 里,只能内联
+        assert.match(ext.imageCssUrl(tiff), /^data:image\/png;base64,/, 'tiff 必须真的内联出 data URI');
+        // 强制内联开关
+        assert.match(ext.imageCssUrl(png, true), /^data:image\/png;base64,/, 'inline=true 应产出 data URI');
+
+        // 文件不存在时不该产出 CSP 会拒绝的 file:// —— 那是静默失效
+        const gone = path.join(tmp, 'nope.tiff');
+        assert.ok(!ext.imageCssUrl(gone).startsWith('file:'), '缺失文件不该产出 file:// URL');
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
 });
 
 // —— 端到端:这条直接复现原 bug(文件写到不存在的 Windows 目录 → 静默失效) ——

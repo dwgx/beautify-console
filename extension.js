@@ -285,6 +285,10 @@ function copyIntoBackgrounds(srcPath) {
 function imageCssUrl(absPath, inline) {
     if (!absPath) return '';
     if (!inline && canUseWorkbenchUrl(absPath)) return toWorkbenchUrl(absPath);
+    // 走内联路径但文件不在:imageToDataUri 会原样退回 file:// URL,而那正是
+    // workbench CSP 拒绝加载的东西 —— CSS 里留下一条注定失败的规则。
+    // 返回空串,让 regionCss 把这张图整个滤掉,失败得干脆一点。
+    if (!fs.existsSync(absPath)) return '';
     // 内嵌路径先看体积
     try {
         const size = fs.statSync(absPath).size;
