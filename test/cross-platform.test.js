@@ -388,6 +388,36 @@ test('regionCss 在整个输入空间产出合法 CSS', () => {
     assert.match(weird, /url\("vscode-file:\/\/vscode-app\/pics\/a%20b\(c\)'d\.png"\)/);
 });
 
+test('每个区域的规则都不得越出自己的区域', () => {
+    // 曾经给编辑器区加过无作用域的
+    // `.monaco-editor, .monaco-editor .margin, .monaco-editor-background`。
+    // 出货样式表里有 160 条规则给 .monaco-editor 后代设背景且都不带 !important,
+    // 于是被我们全部压过 —— peek view、notebook 单元格、输出面板、源代码管理
+    // 提交框统统被抹平,而用户只开了编辑器区的背景。
+    const scopeOf = {
+        editor: '.editor-group-container',
+        sidebar: '.part.sidebar',
+        panel: '.part.panel'
+    };
+    for (const key of ext.REGION_KEYS) {
+        const css = ext.regionCss(key, { images: ['/a.png', '/b.png'], opacity: 0.2, intervalMs: 8000 });
+        const scope = scopeOf[key];
+        assert.ok(scope, `新区域 ${key} 需要在本用例里声明它的作用域前缀`);
+        for (const line of css.split('\n')) {
+            const m = line.match(/^([^{@\/\s][^{]*)\{/);
+            if (!m) continue;                       // 跳过声明行、注释、@ 规则
+            const sel = m[1].trim();
+            if (sel.startsWith('@')) continue;
+            assert.ok(sel.includes(scope),
+                `${key} 的选择器越出区域(缺 ${scope}): ${sel.slice(0, 90)}`);
+        }
+        // 透明化条目本身也必须带上作用域
+        for (const t of ext.REGIONS[key].transparent) {
+            assert.ok(t.includes(scope), `${key} 的透明化选择器缺作用域: ${t}`);
+        }
+    }
+});
+
 test('regionCss 的图层声明全部带 !important(级联顺序对我们不利)', () => {
     // Custom UI Style 把 external.css 注入在 workbench.desktop.main.css 之前
     // (本机 workbench.html 核对:1313 vs 1415),同优先级下 VS Code 一律胜出。

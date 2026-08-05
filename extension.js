@@ -173,10 +173,16 @@ const REGIONS = {
     editor: {
         label: '编辑器',
         container: '.editor-group-container > .editor-container > .editor-instance',
-        transparent: [
-            '.monaco-editor, .monaco-editor .margin, .monaco-editor-background',
-            '.monaco-editor .minimap'
-        ],
+        // 刻意不做任何透明化。图层是 z-index:10 的 ::after 覆盖层,而
+        // .editor-instance / .monaco-editor 都不建立层叠上下文,所以它本来就画在
+        // 文字之上 —— 同仓库的 codeOnlyCss 用同一容器同一覆盖层、不带任何透明化,
+        // 注释注明「经真实 DOM 验证有效」。
+        // 曾经加过 `.monaco-editor, .monaco-editor .margin, .monaco-editor-background`,
+        // 那是重大误判:该选择器没有作用域,出货样式表里有 160 条规则给
+        // .monaco-editor 后代设背景且都不带 !important,于是被我们全部压过 ——
+        // peek view、notebook 单元格、输出面板、源代码管理提交框统统被抹平,
+        // 而用户只开了编辑器区的背景。
+        transparent: [],
         defaultOpacity: 0.22
     },
     sidebar: {
