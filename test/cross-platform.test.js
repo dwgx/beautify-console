@@ -388,6 +388,36 @@ test('regionCss 在整个输入空间产出合法 CSS', () => {
     assert.match(weird, /url\("vscode-file:\/\/vscode-app\/pics\/a%20b\(c\)'d\.png"\)/);
 });
 
+test('区域名走白名单,__proto__ 不得污染原型', async () => {
+    const fs = require('node:fs');
+    const vscodeStub = require('./vscode-stub.js');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-proto-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        const panel = { webview: { postMessage() {} } };
+        vscodeStub.window.errors.length = 0;
+
+        // st.regions[msg.region] 的裸下标访问会命中原型:实测 region='__proto__'
+        // 能把 Object.prototype.opacity 设成 0.5,宿主里每个普通对象都带上它。
+        for (const bad of ['__proto__', 'constructor', 'prototype', 'toString', 'nope']) {
+            await ext.handleMessage({ type: 'regionOpacity', region: bad, value: 0.5 }, panel);
+        }
+        assert.strictEqual(({}).opacity, undefined, 'Object.prototype 被污染');
+        assert.strictEqual([].opacity, undefined);
+        assert.strictEqual(vscodeStub.window.errors.length, 5, '每次非法区域都该明确报错');
+        assert.match(vscodeStub.window.errors[0], /未知区域/);
+
+        // 合法区域不受影响
+        await ext.handleMessage({ type: 'regionOpacity', region: 'editor', value: 0.33 }, panel);
+        assert.strictEqual(ext.readBeautifyState().regions.editor.opacity, 0.33);
+    } finally {
+        vscodeStub.window.errors.length = 0;
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('每个区域的规则都不得越出自己的区域', () => {
     // 曾经给编辑器区加过无作用域的
     // `.monaco-editor, .monaco-editor .margin, .monaco-editor-background`。

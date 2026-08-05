@@ -1108,6 +1108,16 @@ async function applyBg(mode, noReload) {
     if (!noReload) await reloadCUS();
 }
 
+// 取区域配置,区域名必须在白名单内。
+// 直接用 st.regions[msg.region] 会被 "__proto__" 命中原型:实测
+// {type:'regionOpacity', region:'__proto__', value:0.5} 会让
+// Object.prototype.opacity 变成 0.5,宿主进程里每个普通对象都带上它。
+// 消息来自我们自己的 webview,不算外部输入,但污染是进程级的,不该留。
+function regionCfgOf(st, key) {
+    if (!REGION_KEYS.includes(key)) throw new Error(`未知区域 ${key}`);
+    return st.regions[key];
+}
+
 // 存状态 → 重写 CSS → 刷新面板 → 标记待重启。多区域的每次改动都走这里。
 function applyRegionState(st, panel) {
     writeBeautifyState(st);
@@ -1269,8 +1279,7 @@ async function handleMessage(msg, panel) {
             });
             if (uri && uri.length) {
                 const st = readBeautifyState();
-                const cfg = st.regions[msg.region];
-                if (!cfg) throw new Error(`未知区域 ${msg.region}`);
+                const cfg = regionCfgOf(st, msg.region);
                 for (const u of uri) {
                     const dest = path.join(getUserDir(), 'backgrounds', safeImageName(path.basename(u.fsPath)));
                     fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -1282,15 +1291,19 @@ async function handleMessage(msg, panel) {
             }
         } else if (msg.type === 'regionClear') {
             const st = readBeautifyState();
-            if (st.regions[msg.region]) st.regions[msg.region].images = [];
+            regionCfgOf(st, msg.region).images = [];
             applyRegionState(st, panel);
         } else if (msg.type === 'regionOpacity') {
             const st = readBeautifyState();
-            if (st.regions[msg.region]) st.regions[msg.region].opacity = msg.value;
+            regionCfgOf(st, msg.region).opacity = msg.value;
             applyRegionState(st, panel);
         } else if (msg.type === 'regionInterval') {
             const st = readBeautifyState();
-            if (st.regions[msg.region]) st.regions[msg.region].intervalMs = msg.value;
+            regionCfgOf(st, msg.region).intervalMs = msg.value;
+            applyRegionState(st, panel);
+        } else if (msg.type === 'setBlend') {
+            const st = readBeautifyState();
+            for (const key of REGION_KEYS) st.regions[key].blend = !!msg.value;
             applyRegionState(st, panel);
         } else if (msg.type === 'setInlineImages') {
             const st = readBeautifyState();
@@ -1615,6 +1628,7 @@ input[type=range]:active::-webkit-slider-thumb { transform: scale(1.25); }
         <h2>多区域背景 <span class="badge">需重载</span></h2>
         <div class="hint">编辑器 / 侧栏 / 面板可各设一张或多张图。多张图会按间隔淡入淡出轮播。</div>
         <div id="regionRows"></div>
+        <div class="row"><label>混合模式<span class="q" tabindex="0" data-tip="开启后用 mix-blend-mode: screen 让图与底色融合,深色主题下更自然。浅色主题会发白,那就关掉。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="blendOn"><span class="slider-sw"></span></label></div></div>
         <div class="row"><label>图片引用方式<span class="q" tabindex="0" data-tip="直接引用=CSS 里只写路径,文件小、加载快(推荐)。内嵌=把图片转成 base64 塞进 CSS,文件会大几十倍,只在直接引用不显示时才用。">?</span></label><div class="ctrl"><div class="seg" id="inlineSeg">
             <button data-v="url">直接引用</button><button data-v="inline">内嵌 base64</button>
         </div></div></div>
@@ -1728,6 +1742,8 @@ function render(){
     // 多区域区块只在该模式下才有意义
     $('secRegions').style.display = (S.bgMode === 'regions') ? '' : 'none';
     setSeg('inlineSeg', S.inlineImages ? 'inline' : 'url');
+    // 任一区域开着就算开 —— 这个开关统一作用于所有区域
+    $('blendOn').checked = Object.values(S.regions || {}).some(r => r && r.blend !== false);
     $('customCssOn').checked = S.customCssEnabled !== false;
     $('panicKey').textContent = (S.platform === 'darwin' ? 'Cmd' : 'Ctrl') + '+Alt+Shift+F12';
 }
@@ -1849,6 +1865,7 @@ $('btnDoRestart').addEventListener('click', ()=>{ vscode.postMessage({type:'doRe
 document.querySelectorAll('#inlineSeg button').forEach(b=>b.addEventListener('click',()=>{
     setSeg('inlineSeg', b.dataset.v); post({type:'setInlineImages', value: b.dataset.v === 'inline'});
 }));
+$('blendOn').addEventListener('change', ()=> post({type:'setBlend', value: $('blendOn').checked}));
 $('customCssOn').addEventListener('change', ()=> post({type:'setCustomCssEnabled', value: $('customCssOn').checked}));
 $('btnEditCss').addEventListener('click', ()=> vscode.postMessage({type:'openCustomCss'}));
 $('btnExport').addEventListener('click', ()=>{ vscode.postMessage({type:'exportConfig'}); showToast('正在导出…'); });
