@@ -1169,9 +1169,10 @@ async function openCustomCss() {
         const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(cusCustomCss()));
         await vscode.window.showTextDocument(doc);
         // 没有文件监听,改完必须显式重载;macOS 上那是整个应用退出重开
-        const hint = process.platform === 'darwin'
-            ? '改完点「应用并重载」—— macOS 会完全退出并重新打开 VS Code。'
-            : '改完点「应用并重载」使其生效。';
+        // Custom UI Style 的 restartApp 在 darwin / win32 / Linux 三条分支上
+        // 都是退出并重新拉起应用,不是 Reload Window。此前只警告了 macOS,
+        // 让 Windows / Linux 用户以为只是刷新窗口。
+        const hint = '改完点「应用并重载」—— 会完全退出并重新打开 VS Code(不是刷新窗口)。';
         vscode.window.showInformationMessage(
             `${hint} 写坏界面时按 ${process.platform === 'darwin' ? 'Cmd' : 'Ctrl'}+Alt+Shift+F12 一键关闭自定义 CSS。`);
     } catch (e) {
