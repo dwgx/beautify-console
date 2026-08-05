@@ -452,6 +452,63 @@ test('settingTypeOk 按声明的类型校验,不依赖当前值是否存在', ()
     assert.strictEqual(ext.settingTypeOk('evil.key', 1), false);
 });
 
+test('导出→导入往返无损且幂等', async () => {
+    const fs = require('node:fs');
+    const vscodeStub = require('./vscode-stub.js');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-rt-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        fs.writeFileSync(path.join(userDir, 'cus-base.css'), ':root { --r: 14px; }\n');
+        fs.writeFileSync(ext.cusCustomCss(), '/* 我的 CSS */\n');
+        const imgs = ['a.png', 'b.jpg'].map(n => {
+            const p = path.join(tmp, n); fs.writeFileSync(p, 'x'); return p;
+        });
+
+        const st = ext.defaultState();
+        st.bgMode = 'regions'; st.animMode = 'bounce';
+        st.regions.editor.images = imgs;
+        st.regions.editor.opacity = 0.17;
+        st.regions.editor.intervalMs = 12000;
+        st.regions.editor.blend = false;
+        ext.writeBeautifyState(st);
+        vscodeStub.__store.set('editor.fontSize', 16);
+
+        const exported = ext.exportConfig();
+        const json = JSON.stringify(exported);
+        assert.ok(!/data:image/.test(json), '导出不该内嵌图片');
+        assert.ok(json.length < 20000, `导出应小巧,实际 ${json.length} 字节`);
+
+        // 打乱现状后导入,应完全还原
+        ext.writeBeautifyState(ext.defaultState());
+        ext.setRadius(4);
+        vscodeStub.__store.set('editor.fontSize', 11);
+
+        const r = await ext.importConfig(JSON.parse(json));
+        assert.deepStrictEqual(r.rejected, [], '自家导出的文件不该有任何被拒项');
+        assert.deepStrictEqual(r.missingImages, []);
+
+        const back = ext.readBeautifyState();
+        assert.strictEqual(back.bgMode, 'regions');
+        assert.strictEqual(back.animMode, 'bounce');
+        assert.deepStrictEqual(back.regions.editor.images, imgs);
+        assert.strictEqual(back.regions.editor.opacity, 0.17);
+        assert.strictEqual(back.regions.editor.intervalMs, 12000);
+        assert.strictEqual(back.regions.editor.blend, false);
+        assert.strictEqual(ext.getRadius(), 14);
+        assert.strictEqual(vscodeStub.__store.get('editor.fontSize'), 16);
+        assert.ok(fs.existsSync(ext.cusCustomCss() + '.bak'), '导入前应备份用户 CSS');
+
+        // 幂等:再导出一次应与首次一致(时间戳除外)
+        const again = { ...ext.exportConfig(), exportedAt: null };
+        assert.deepStrictEqual(again, { ...exported, exportedAt: null });
+    } finally {
+        vscodeStub.__store.delete('editor.fontSize');
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('importConfig 拒绝非本插件的文件', async () => {
     for (const bad of [null, 42, 'str', {}, { kind: 'other' }]) {
         await assert.rejects(() => ext.importConfig(bad), /不是 JSON 对象|不是美化控制台/);
