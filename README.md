@@ -115,6 +115,10 @@ VS Code**，不是刷新窗口 —— 先存好手头的文件。
   - **VS Code 更新后**样式可能失效 → 重新运行 `Custom UI Style: Reload`
 - 背景图会自动复制到用户目录，不怕原图移动丢失
 - 样式改动生效需**完全退出** VS Code（macOS 是 `Command + Q`）。`Reload Window` 不重建 external.css 缓存
+- 图片默认按 `vscode-file://vscode-app` 引用。依据是 workbench 自身就从该 origin 加载（故 CSP 的
+  `img-src 'self'` 覆盖它），且 Electron 的协议校验为「路径在白名单目录下**或**扩展名在白名单内」。
+  这两点是读 Electron 与 Custom UI Style 源码得出的，**未在运行中的 VS Code 里逐一实测**。
+  若背景不显示，把「图片引用方式」切到「内嵌 base64」即可 —— 那条路径是原先验证过的方式
 
 ## 🆘 恢复手段 Recovery
 
