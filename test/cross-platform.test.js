@@ -176,6 +176,39 @@ test('setConfig 单键写入失败不中断整批(未注册键不再吃掉后续
     }
 });
 
+test('从 1.0.5 旧格式迁移不丢配置', () => {
+    const fs = require('node:fs');
+    const vscodeStub = require('./vscode-stub.js');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-mig-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        const img = path.join(tmp, 'old.png');
+        fs.writeFileSync(img, 'x');
+        // 旧格式:单图存在 .beautify-bg-image,模式存在 cus-dynamic.css 的注释里
+        fs.writeFileSync(path.join(userDir, '.beautify-bg-image'), ext.toFileUrl(img));
+        fs.writeFileSync(path.join(userDir, 'cus-dynamic.css'), '/* ANIM:bounce */\n/* BG:codeOnly */\n');
+        vscodeStub.__store.set('beautify.codeOpacity', 0.1);
+
+        const st = ext.readBeautifyState();
+        assert.strictEqual(st.bgMode, 'codeOnly', '旧的背景模式要带过来');
+        assert.strictEqual(st.animMode, 'bounce', '旧的动画档位要带过来');
+        assert.deepStrictEqual(st.regions.editor.images, [img], '旧的单图归到编辑器区域');
+        assert.strictEqual(st.regions.editor.opacity, 0.1, '用户自定义的不透明度不能丢');
+
+        // 迁移不落盘,但必须是确定性的 —— 两次读结果一致
+        assert.deepStrictEqual(ext.readBeautifyState(), st, '重复读取结果必须稳定');
+
+        // 状态文件损坏时回落到迁移,不能抛
+        fs.writeFileSync(path.join(userDir, 'beautify-state.json'), '{ 这不是 JSON');
+        assert.strictEqual(ext.readBeautifyState().bgMode, 'codeOnly', '损坏文件应回落到迁移');
+    } finally {
+        vscodeStub.__store.delete('beautify.codeOpacity');
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('改动画档位不得抹掉多区域背景', async () => {
     const fs = require('node:fs');
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-anim-'));
