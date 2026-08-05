@@ -512,6 +512,62 @@ test('settingTypeOk 按声明的类型校验,不依赖当前值是否存在', ()
     assert.strictEqual(ext.settingTypeOk('evil.key', 1), false);
 });
 
+test('Windows 导出的配置在 POSIX 上归入「本机不存在」而非「不合法」', async () => {
+    const fs = require('node:fs');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-xp-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        fs.writeFileSync(path.join(userDir, 'cus-base.css'), ':root { --r: 8px; }\n');
+
+        // path.isAbsolute 绑在宿主平台:Windows 路径在 POSIX 上不算绝对路径,
+        // 此前会被判成「不合法」丢弃,用户看到「N 项不合法」而不是「本机不存在」。
+        const r = await ext.importConfig({
+            kind: 'beautify-console-config', version: 1, settings: {},
+            state: { bgMode: 'regions', regions: { editor: { images: ['C:\\Users\\bob\\a.png', 'C:\\Users\\bob\\b.jpg'] } } }
+        });
+        assert.deepStrictEqual(r.rejected, [], 'Windows 路径不该被判为不合法');
+        assert.strictEqual(r.missingImages.length, 2, '应归入本机不存在并列出');
+
+        // 相对路径仍然拒收 —— 它会相对 workbench 解析到 app bundle 内部
+        assert.strictEqual(ext.isAbsoluteAnyPlatform('relative/a.png'), false);
+        assert.strictEqual(ext.isAbsoluteAnyPlatform('C:\\x\\a.png'), true);
+        assert.strictEqual(ext.isAbsoluteAnyPlatform('/Users/x/a.png'), true);
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('同名不同图不得互相覆盖(复制一份的承诺不能被自己破坏)', () => {
+    const fs = require('node:fs');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-dup-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        fs.mkdirSync(path.join(tmp, 'nature'));
+        fs.mkdirSync(path.join(tmp, 'city'));
+        const a = path.join(tmp, 'nature', 'bg.png');
+        const b = path.join(tmp, 'city', 'bg.png');
+        fs.writeFileSync(a, 'AAAA-nature');
+        fs.writeFileSync(b, 'BBBB-city');
+
+        // 此前只按文件名落盘,两张不同的图写到同一个 bg.png,后者覆盖前者
+        const d1 = ext.copyIntoBackgrounds(a);
+        const d2 = ext.copyIntoBackgrounds(b);
+        assert.notStrictEqual(d1, d2, '同名不同图必须各自落盘');
+        assert.strictEqual(fs.readFileSync(d1, 'utf8'), 'AAAA-nature', '先前那张不能被覆盖');
+        assert.strictEqual(fs.readFileSync(d2, 'utf8'), 'BBBB-city');
+
+        // 重选同一张图应复用,不该无限堆积
+        assert.strictEqual(ext.copyIntoBackgrounds(a), d1, '内容相同应复用');
+        assert.strictEqual(fs.readdirSync(path.join(userDir, 'backgrounds')).length, 2);
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('连续导入不得毁掉用户手写的 CSS', async () => {
     const fs = require('node:fs');
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-bak-'));

@@ -253,6 +253,34 @@ function safeImageName(name) {
 const INLINE_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
 const skippedInlineImages = new Set();
 
+// 把选中的图复制进 backgrounds/,返回目标绝对路径。
+// 目标名撞车时补序号:此前只按文件名落盘,选了 nature/bg.png 和 city/bg.png
+// 两张不同的图会写到同一个 bg.png,后者覆盖前者,列表里还只剩一条 ——
+// 「复制一份所以原图移动也不怕」这个承诺被自己后来的选图破坏掉了。
+// 内容相同则复用,避免重复选同一张图时越堆越多。
+function copyIntoBackgrounds(srcPath) {
+    try {
+        const dir = path.join(getUserDir(), 'backgrounds');
+        fs.mkdirSync(dir, { recursive: true });
+        const name = safeImageName(path.basename(srcPath));
+        const ext = path.extname(name);
+        const stem = path.basename(name, ext);
+        const src = fs.readFileSync(srcPath);
+        let dest = path.join(dir, name);
+        for (let i = 2; ; i++) {
+            if (!fs.existsSync(dest)) break;
+            // 已有同名文件:内容一致就直接复用,不一致才另起名字
+            try { if (fs.readFileSync(dest).equals(src)) return dest; } catch (e) { /* 读不了就改名 */ }
+            dest = path.join(dir, `${stem}-${i}${ext}`);
+        }
+        fs.writeFileSync(dest, src);
+        return dest;
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 复制图片失败 — ${e.message}`);
+        return null;
+    }
+}
+
 // 单张图 → CSS url() 值。inline 为真时强制内联 base64(兜底开关)
 function imageCssUrl(absPath, inline) {
     if (!absPath) return '';
@@ -545,6 +573,16 @@ function migrateLegacyState() {
 const ANIM_MODES = ['default', 'smooth', 'bounce', 'fancy', 'off'];
 const BG_MODES = ['off', 'full', 'codeOnly', 'regions'];
 
+// 路径在【任一】平台上是绝对路径就算过。
+// path.isAbsolute 绑在宿主平台上:`C:\Users\bob\a.png` 在 POSIX 上不算绝对路径,
+// 于是从 Windows 导出的配置在 macOS 上会被判成「不合法」并丢弃,用户看到的是
+// 「3 项不合法」而不是「本机不存在」—— 措辞与事实不符。放宽这一层,
+// 存在性交给 fs.existsSync 判,措辞就对了。相对路径仍然拒收,
+// 它会相对 workbench 解析到 app bundle 内部。
+function isAbsoluteAnyPlatform(p) {
+    return path.isAbsolute(p) || path.win32.isAbsolute(p) || path.posix.isAbsolute(p);
+}
+
 function sanitizeState(raw) {
     const st = defaultState();
     const rejected = [];
@@ -567,7 +605,7 @@ function sanitizeState(raw) {
         // app bundle 内部,既无效也不该允许。
         if (Array.isArray(src.images)) {
             for (const p of src.images) {
-                if (typeof p === 'string' && p && path.isAbsolute(p)) dst.images.push(p);
+                if (typeof p === 'string' && p && isAbsoluteAnyPlatform(p)) dst.images.push(p);
                 else rejected.push(`${k}.images 里的 ${JSON.stringify(p)}`);
             }
         }
@@ -1322,10 +1360,8 @@ async function handleMessage(msg, panel) {
                 const st = readBeautifyState();
                 const cfg = regionCfgOf(st, msg.region);
                 for (const u of uri) {
-                    const dest = path.join(getUserDir(), 'backgrounds', safeImageName(path.basename(u.fsPath)));
-                    fs.mkdirSync(path.dirname(dest), { recursive: true });
-                    fs.copyFileSync(u.fsPath, dest);
-                    if (!cfg.images.includes(dest)) cfg.images.push(dest);
+                    const dest = copyIntoBackgrounds(u.fsPath);
+                    if (dest && !cfg.images.includes(dest)) cfg.images.push(dest);
                 }
                 st.bgMode = 'regions';
                 applyRegionState(st, panel);
@@ -1431,7 +1467,7 @@ module.exports = {
     // 多区域背景 / 轮播
     REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
     imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss, safeImageName,
-    INLINE_IMAGE_MAX_BYTES,
+    INLINE_IMAGE_MAX_BYTES, copyIntoBackgrounds, isAbsoluteAnyPlatform,
     isCustomCssEnabled, panicDisableCustomCss, applyBg, readState, handleMessage, restoreDefaults,
     // 状态
     STATE_VERSION, stateFile, defaultState, sanitizeState, readBeautifyState, writeBeautifyState,
