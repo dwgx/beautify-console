@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.1.0] - 2026-08-05
+
+### 新增
+- **多区域背景**：编辑器 / 侧栏 / 面板各自独立的图片、不透明度、混合模式。选择器逐条对照 VS Code 1.131 的 workbench CSS 核对
+- **多图轮播**：某区域放 2 张以上图片即自动轮播，淡入淡出、每张停留时长可调，遵循系统「减少动效」设置。纯 CSS 实现，无后台定时器
+- **自定义 CSS**：独立的 `cus-custom.css`，本插件只创建不覆盖，注入顺序排最后使用户规则优先。配套「美化: 紧急关闭自定义 CSS」命令与快捷键 `Cmd/Ctrl+Alt+Shift+F12`
+- **配置导入导出**：整套配置存为单个 JSON，图片按路径引用。导入逐项校验，非法值、未知键、缺失图片全部报出
+
+### 变更
+- **图片改用 `vscode-file://vscode-app` 引用，不再内嵌 base64**。workbench 自身就从该 origin 加载，故 CSP 的 `img-src 'self'` 覆盖它；Electron 的协议校验是「路径在白名单目录下**或**扩展名在白名单内」，后者让任意位置的图片可直接引用。12 张 2MB 图从 33MB CSS 降到约 1KB。白名单外的格式仍走 base64，面板也留了强制内嵌开关
+
+### 修复
+- 复制进 `backgrounds/` 的文件名会被清洗：全窗口模式把路径交给 Custom UI Style，它按 `url('...')` 单引号拼接且不转义，而 `pathToFileURL` 不转义单引号，名字带 `')` 的图片会提前闭合该 CSS 规则
+- 区域图层的每条声明都带 `!important`：Custom UI Style 把 `external.css` 注入在 `workbench.desktop.main.css` **之前**（本机 `workbench.html` 核对为 1313 vs 1415），同优先级下 VS Code 一律胜出
+- `applyBg` 补上 `regions` 分支 —— 此前选「多区域」会落进 `else` 写成 `off`，静默丢弃选择
+
 ## [1.0.5] - 2026-08-05
 
 ### 修复
