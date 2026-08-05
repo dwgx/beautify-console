@@ -1306,6 +1306,9 @@ async function restoreDefaults(panel) {
     // 恢复默认 = 干净 JetBrains 外观:动画回 default 档,背景图关闭
     failed.push(...await setConfig([['custom-ui-style.background.url', '']]));
     failed.push(...await setConfig([['custom-ui-style.stylesheet', {}]]));  // 清空失效的旧设置残留
+    // 状态文件也要复位 —— 只写 CSS 的话,状态里仍记着 regions 和各区域图片列表,
+    // 与「已移除背景图」的提示不符,下次切回多区域旧图会自己冒出来。
+    writeBeautifyState(defaultState());
     writeDynamicCss('default', 'off');
     pendingRestart = false;
     await reloadCUS();
@@ -1325,7 +1328,7 @@ module.exports = {
     // 多区域背景 / 轮播
     REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
     imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss, safeImageName,
-    isCustomCssEnabled, panicDisableCustomCss, applyBg, readState, handleMessage,
+    isCustomCssEnabled, panicDisableCustomCss, applyBg, readState, handleMessage, restoreDefaults,
     // 状态
     STATE_VERSION, stateFile, defaultState, sanitizeState, readBeautifyState, writeBeautifyState,
     migrateLegacyState, ANIM_MODES, BG_MODES,
