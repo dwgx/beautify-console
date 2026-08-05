@@ -523,6 +523,45 @@ test('sanitizeState 对垃圾输入不抛异常', () => {
     }
 });
 
+test('图片扩展名不得注入 CSS(两层都要挡住)', () => {
+    const fs = require('node:fs');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-inj-'));
+    try {
+        // 扩展名会被拼进 data:image/<ext>。此前只清洗了文件名主干,于是
+        // `a.x");}body{display:none}` 的扩展名原样进入 CSS:双引号闭合字符串、
+        // ) 闭合 url()、;} 结束规则,随后 body{display:none} 藏掉整个界面。
+        const evil = 'wallpaper.a");}body{display:none}';
+
+        // 第一层:清洗时扩展名只认白名单
+        const safe = ext.safeImageName(evil);
+        assert.ok(!safe.includes('"'), `清洗后仍含双引号: ${safe}`);
+        assert.strictEqual(safe, 'wallpaper.png', '白名单外的扩展名应回落 .png');
+
+        // 第二层:直接把恶意文件名落到磁盘,绕过清洗(导入的配置可指向任何既有文件)
+        const p = path.join(tmp, evil);
+        fs.writeFileSync(p, 'x');
+        const url = ext.imageCssUrl(p, false);
+        assert.ok(!url.includes('"'), `data URI 仍含双引号: ${url.slice(0, 60)}`);
+        assert.match(url, /^data:image\/png;base64,/, 'mime 应回落白名单内的 png');
+
+        // 整体 CSS:url() 之外不得出现 { } ; 之类的规则语法
+        const css = ext.regionCss('editor', { images: [p], opacity: 0.22 });
+        const line = (css.match(/background-image:[^\n]*/) || [''])[0];
+        const withoutUrl = line.replace(/url\("[^"]*"\)/, 'URL').replace(/ !important;$/, '');
+        assert.ok(!/[{};]/.test(withoutUrl), `规则被提前闭合: ${line.slice(0, 100)}`);
+
+        // 各白名单扩展名的 mime 映射正确
+        for (const [name, want] of [['a.jpg', 'jpeg'], ['a.jpeg', 'jpeg'], ['a.png', 'png'],
+                                    ['a.webp', 'webp'], ['a.svg', 'svg+xml'], ['a.gif', 'gif']]) {
+            const q = path.join(tmp, name);
+            fs.writeFileSync(q, 'x');
+            assert.match(ext.imageCssUrl(q, true), new RegExp(`^data:image/${want.replace('+', '\\+')};`), name);
+        }
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('safeImageName 清洗掉能破坏 CSS 规则的字符', () => {
     // 全窗口模式把路径交给 Custom UI Style,它用 url('...') 单引号拼接且不转义,
     // 而 pathToFileURL 不转义单引号 —— 名字带 ') 的图会提前闭合这条规则。

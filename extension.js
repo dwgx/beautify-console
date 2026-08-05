@@ -74,16 +74,28 @@ function fromFileUrl(fileUrl) {
     catch (e) { return s; }
 }
 
+// 扩展名 → data URI 的 mime 子类型。白名单之外一律回落 png,
+// 绝不把文件名里的任意文本拼进 CSS。
+const DATA_URI_MIME = {
+    '.png': 'png', '.jpg': 'jpeg', '.jpeg': 'jpeg', '.webp': 'webp',
+    '.gif': 'gif', '.bmp': 'bmp', '.svg': 'svg+xml'
+};
+function dataUriMime(p) {
+    return DATA_URI_MIME[path.extname(String(p)).toLowerCase()] || 'png';
+}
+
 // 把本地图片转成 base64 data URI —— 绕过 workbench CSP 对 file:/// 的拦截(关键修复)
 function imageToDataUri(fileUrl) {
     try {
         if (!fileUrl || String(fileUrl).startsWith('data:')) return fileUrl;
         const p = fromFileUrl(fileUrl);
         if (!fs.existsSync(p)) return fileUrl; // 找不到就退回原路径
-        const ext = (path.extname(p).slice(1) || 'png').toLowerCase();
-        const mime = ext === 'jpg' ? 'jpeg' : ext;
+        // mime 只能取自白名单。扩展名来自文件名,直接拼进 data URI 的话,
+        // 形如 `a.x");}body{display:none}` 的文件就能闭合 CSS 字符串注入规则。
+        // 这一层独立于 safeImageName:导入的配置可以指向任何既有文件,
+        // 那些文件名从未经过清洗。
         const b64 = fs.readFileSync(p).toString('base64');
-        return `data:image/${mime};base64,${b64}`;
+        return `data:image/${dataUriMime(p)};base64,${b64}`;
     } catch (e) { return fileUrl; }
 }
 
@@ -218,11 +230,15 @@ function safeImageName(name) {
     // 先剥掉开头的点,否则 ".png" 会被 extname 当成无扩展名的隐藏文件,
     // 清洗后变成 "_png" —— 扩展名没了,vscode-file 白名单也就命中不了。
     const bare = String(name).replace(/^\.+/, '');
-    const ext = path.extname(bare).toLowerCase();
+    const rawExt = path.extname(bare).toLowerCase();
     const stem = path.basename(bare, path.extname(bare))
         .replace(/['"(){};\\\r\n]/g, '_')   // CSS url() / 规则语法里有特殊含义的字符
         .slice(0, 80);
-    return (stem || 'image') + (ext || '.png');
+    // 扩展名同样必须清洗,而且只认白名单。此前只洗了主干:名为
+    // `a.x");}body{display:none}` 的文件,扩展名会被原样带进
+    // `data:image/<扩展名>`,双引号闭合 CSS 字符串后即可注入任意规则。
+    const ext = VSCODE_FILE_EXTS.includes(rawExt) ? rawExt : '.png';
+    return (stem || 'image') + ext;
 }
 
 // 内嵌 base64 的单图上限。base64 膨胀约 1.33 倍,而这个 CSS 每次开窗都要被
