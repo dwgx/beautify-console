@@ -581,12 +581,33 @@ function sanitizeState(raw) {
     return { state: st, rejected };
 }
 
+// 已经就损坏文件提示过没有 —— 每次读都弹一次会刷屏
+let corruptStateReported = false;
+
 function readBeautifyState() {
+    let text = null;
+    try { text = fs.readFileSync(stateFile(), 'utf8'); }
+    catch (e) { return migrateLegacyState(); }   // 文件不存在 = 首次运行,静默迁移
     try {
-        const raw = JSON.parse(fs.readFileSync(stateFile(), 'utf8'));
-        return sanitizeState(raw).state;
+        const st = sanitizeState(JSON.parse(text)).state;
+        // 读到好文件就复位:用户修好之后再次损坏,应该再提示一次
+        corruptStateReported = false;
+        return st;
     } catch (e) {
-        // 首次运行 / 文件损坏 → 从旧格式迁移一次
+        // 文件在但解析不了(写入中崩溃 / 磁盘满 / 同步冲突)。此前这里静默回落到
+        // 默认值,下一次面板操作就把空状态写回磁盘,各区域用了哪些图、什么不透明度
+        // 和间隔全部永久丢失且毫无提示。现在把原文件挪到一边并告知。
+        if (!corruptStateReported) {
+            corruptStateReported = true;
+            let kept = null;
+            try {
+                kept = uniqueBackupPath(stateFile(), '.corrupt');
+                fs.renameSync(stateFile(), kept);
+            } catch (e2) { kept = null; }
+            vscode.window.showWarningMessage(
+                '美化控制台: 状态文件损坏,已回落到默认设置。' +
+                (kept ? `原文件保留为 ${path.basename(kept)},可手工找回区域配置。` : ''));
+        }
         return migrateLegacyState();
     }
 }
@@ -599,6 +620,16 @@ function readBeautifyState() {
 // 且人也没法手改。导入时逐个检查存在性,缺图明确报出来。
 // ============================================================
 const EXPORT_KIND = 'beautify-console-config';
+
+// 备份路径:时间戳只到毫秒,两次快速导入会落在同一毫秒上把前一份覆盖掉,
+// 所以撞名时补序号,确保每次替换都留得下来。
+function uniqueBackupPath(base, suffix) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const ext = suffix || '.bak';
+    let p = `${base}.${stamp}${ext}`;
+    for (let i = 2; fs.existsSync(p); i++) p = `${base}.${stamp}-${i}${ext}`;
+    return p;
+}
 
 // 导出会带上的 VS Code 设置键 → 允许的值类型。
 // 类型必须写死,不能拿 cfg.get() 的当前值去比 —— 键在本机没设过时当前值是
@@ -696,19 +727,27 @@ async function importConfig(raw) {
     if (typeof raw.radius === 'number' && raw.radius >= 0 && raw.radius <= 40) setRadius(Math.round(raw.radius));
     else if (raw.radius !== undefined) rejected.push(`radius=${JSON.stringify(raw.radius)}`);
 
-    // 自定义 CSS 属于用户资产,导入前先备份,别人的配置不该无声覆盖你写的
+    // 自定义 CSS 属于用户资产。备份必须带时间戳:固定的 .bak 会被下一次导入
+    // 覆盖,连导两次原文就彻底没了(实测:第二次导入后 .bak 里是第一次导入的内容)。
+    let customCssReplaced = null;
     if (typeof raw.customCss === 'string') {
         try {
-            if (fs.existsSync(cusCustomCss())) {
-                fs.copyFileSync(cusCustomCss(), cusCustomCss() + '.bak');
+            let old = '';
+            try { old = fs.readFileSync(cusCustomCss(), 'utf8'); } catch (e) { /* 没有就当空 */ }
+            if (old !== raw.customCss) {
+                if (old.trim()) {
+                    const bak = uniqueBackupPath(cusCustomCss());
+                    fs.copyFileSync(cusCustomCss(), bak);
+                    customCssReplaced = path.basename(bak);
+                }
+                fs.writeFileSync(cusCustomCss(), raw.customCss);
             }
-            fs.writeFileSync(cusCustomCss(), raw.customCss);
         } catch (e) { rejected.push(`自定义 CSS 写入失败: ${e.message}`); }
     }
 
     writeBeautifyState(state);
     writeDynamicCss(state.animMode, state.bgMode, state);
-    return { applied: true, rejected, missingImages, failedKeys };
+    return { applied: true, rejected, missingImages, failedKeys, customCssReplaced };
 }
 
 function writeBeautifyState(st) {
@@ -1170,6 +1209,8 @@ async function doImportConfig(panel) {
         if (r.missingImages.length) notes.push(`${r.missingImages.length} 张图在本机不存在,已跳过`);
         if (r.rejected.length) notes.push(`${r.rejected.length} 项不合法已丢弃`);
         if (r.failedKeys.length) notes.push(`${r.failedKeys.length} 个设置键写入失败`);
+        // 覆盖用户手写的 CSS 是最该说清的一件事,不能只报数字
+        if (r.customCssReplaced) notes.push(`你的自定义 CSS 已被替换,原文备份为 ${r.customCssReplaced}`);
         vscode.window.showInformationMessage(
             '配置已导入' + (notes.length ? `(${notes.join(';')})` : '') + '。重启后生效。');
         if (r.rejected.length) console.warn('[美化控制台] 导入时丢弃:', r.rejected.join(', '));

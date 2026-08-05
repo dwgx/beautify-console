@@ -512,6 +512,70 @@ test('settingTypeOk 按声明的类型校验,不依赖当前值是否存在', ()
     assert.strictEqual(ext.settingTypeOk('evil.key', 1), false);
 });
 
+test('连续导入不得毁掉用户手写的 CSS', async () => {
+    const fs = require('node:fs');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-bak-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        fs.writeFileSync(path.join(userDir, 'cus-base.css'), ':root { --r: 8px; }\n');
+
+        const mine = '/* 我三个月的 CSS */\n';
+        fs.writeFileSync(ext.cusCustomCss(), mine);
+        const mk = css => ({ kind: 'beautify-console-config', version: 1, settings: {}, state: {}, customCss: css });
+
+        // 固定的 .bak 会被第二次导入覆盖,原文就此消失
+        const r1 = await ext.importConfig(mk('/* 第一次 */\n'));
+        await ext.importConfig(mk('/* 第二次 */\n'));
+
+        const baks = fs.readdirSync(userDir).filter(f => f.endsWith('.bak'));
+        assert.strictEqual(baks.length, 2, '每次替换都该留一份带时间戳的备份');
+        const contents = baks.map(f => fs.readFileSync(path.join(userDir, f), 'utf8'));
+        assert.ok(contents.includes(mine), '用户原文必须仍可找回');
+        // 覆盖用户资产必须明说,不能只报数字
+        assert.ok(r1.customCssReplaced, '应报出备份文件名');
+
+        // 内容相同则不该产生多余备份
+        const n = fs.readdirSync(userDir).filter(f => f.endsWith('.bak')).length;
+        await ext.importConfig(mk('/* 第二次 */\n'));
+        assert.strictEqual(fs.readdirSync(userDir).filter(f => f.endsWith('.bak')).length, n, '内容未变不该重复备份');
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('状态文件损坏时保留原文件并告知,不静默清空', () => {
+    const fs = require('node:fs');
+    const vscodeStub = require('./vscode-stub.js');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-corrupt-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+
+        const st = ext.defaultState();
+        st.bgMode = 'regions';
+        st.regions.editor.images = ['/a.png', '/b.png', '/c.png'];
+        st.regions.editor.opacity = 0.31;
+        ext.writeBeautifyState(st);
+        // 模拟写入中崩溃 / 磁盘满 / 同步冲突
+        const raw = fs.readFileSync(ext.stateFile(), 'utf8');
+        fs.writeFileSync(ext.stateFile(), raw.slice(0, -3));
+
+        vscodeStub.window.warnings.length = 0;
+        ext.readBeautifyState();
+        // 此前这里静默回落默认值,下一次面板操作就把空状态写回,配置永久丢失
+        assert.ok(vscodeStub.window.warnings.length >= 1, '损坏必须告知用户');
+        const kept = fs.readdirSync(userDir).filter(f => f.endsWith('.corrupt'));
+        assert.strictEqual(kept.length, 1, '损坏的原文件必须留一份');
+        assert.match(fs.readFileSync(path.join(userDir, kept[0]), 'utf8'), /0\.31/, '原配置应仍能人工找回');
+    } finally {
+        vscodeStub.window.warnings.length = 0;
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('导出→导入往返无损且幂等', async () => {
     const fs = require('node:fs');
     const vscodeStub = require('./vscode-stub.js');
@@ -558,7 +622,8 @@ test('导出→导入往返无损且幂等', async () => {
         assert.strictEqual(back.regions.editor.blend, false);
         assert.strictEqual(ext.getRadius(), 14);
         assert.strictEqual(vscodeStub.__store.get('editor.fontSize'), 16);
-        assert.ok(fs.existsSync(ext.cusCustomCss() + '.bak'), '导入前应备份用户 CSS');
+        // 这里导入的 customCss 与现有内容相同,按设计不该产生多余备份
+        assert.strictEqual(r.customCssReplaced, null, '内容未变时不该备份');
 
         // 幂等:再导出一次应与首次一致(时间戳除外)
         const again = { ...ext.exportConfig(), exportedAt: null };
