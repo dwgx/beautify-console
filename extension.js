@@ -200,10 +200,14 @@ const REGIONS = {
     panel: {
         label: '面板',
         container: '.monaco-workbench .part.panel > .content > .composite',
+        // 注意这里的 .monaco-editor 系列【必须】带上 .part.panel 前缀:
+        // 不限定作用域会波及编辑器、peek view、notebook 等等(出货样式表里有 160
+        // 条规则给 .monaco-editor 后代设背景且都不带 !important)。
+        // 不列 .xterm-screen —— 出货声明只有 z-index:31,没有背景可覆盖;
+        // 而 .pane-body.integrated-terminal 本身已是 transparent !important。
         transparent: [
             '.monaco-workbench .part.panel',
-            '.monaco-workbench .part.panel > .content .monaco-editor, .monaco-workbench .part.panel > .content .monaco-editor .margin, .monaco-workbench .part.panel > .content .monaco-editor .monaco-editor-background',
-            '.monaco-workbench .part.panel .xterm-screen'
+            '.monaco-workbench .part.panel > .content .monaco-editor, .monaco-workbench .part.panel > .content .monaco-editor .margin, .monaco-workbench .part.panel > .content .monaco-editor .monaco-editor-background'
         ],
         defaultOpacity: 0.18
     }
@@ -521,8 +525,23 @@ function writeDynamicCss(animMode, bgMode, state) {
         if (parts.length) out += '/* ---- 多区域背景 ---- */\n' + parts.join('\n\n') + '\n';
         reportSkippedInlineImages();
     }
-    try { fs.writeFileSync(cusDynamicCss(), out); return true; } catch (e) { return false; }
+    // 写失败必须报出来。此前 11 个调用点全都丢掉返回值,而 writeBeautifyState
+    // 是会报错的 —— 这个不对称造成:CSS 文件只读时,状态文件写成了(记着已清空)、
+    // CSS 没写成(图还在),面板照常提示成功,重启后图依然在,且此后永久如此。
+    try {
+        fs.writeFileSync(cusDynamicCss(), out);
+        dynamicCssWriteFailed = false;
+        return true;
+    } catch (e) {
+        if (!dynamicCssWriteFailed) {
+            dynamicCssWriteFailed = true;   // 连续失败只提示一次,避免拖滑块时刷屏
+            vscode.window.showErrorMessage(
+                `美化控制台: 样式文件写入失败,改动不会生效 — ${e.message}`);
+        }
+        return false;
+    }
 }
+let dynamicCssWriteFailed = false;
 
 // 从 cus-dynamic.css 的标记注释读当前模式
 function readDynamicModes() {

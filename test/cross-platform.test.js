@@ -633,6 +633,45 @@ test('连续导入不得毁掉用户手写的 CSS', async () => {
     }
 });
 
+test('样式文件写不进去时必须报错,而不是假装成功', async () => {
+    const fs = require('node:fs');
+    const vscodeStub = require('./vscode-stub.js');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-ro-'));
+    let cssPath = null;
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        const img = path.join(tmp, 'bg.png');
+        fs.writeFileSync(img, 'x');
+        const st = ext.defaultState();
+        st.bgMode = 'regions';
+        st.regions.editor.images = [img];
+        ext.writeBeautifyState(st);
+        ext.writeDynamicCss('default', 'regions', st);
+
+        // 只读:writeBeautifyState 会成功,writeDynamicCss 会失败。此前 11 个调用点
+        // 全丢掉返回值 —— 状态记着已清空、CSS 里图还在、面板照常报成功,且永久如此。
+        cssPath = path.join(userDir, 'cus-dynamic.css');
+        fs.chmodSync(cssPath, 0o444);
+        vscodeStub.window.errors.length = 0;
+        const panel = { webview: { postMessage() {} } };
+        await ext.handleMessage({ type: 'regionClear', region: 'editor' }, panel);
+
+        assert.ok(vscodeStub.window.errors.length >= 1, '写入失败必须告知用户');
+        assert.match(vscodeStub.window.errors[0], /写入失败/);
+
+        // 连续操作不该刷屏
+        const n = vscodeStub.window.errors.length;
+        await ext.handleMessage({ type: 'regionOpacity', region: 'editor', value: 0.4 }, panel);
+        assert.strictEqual(vscodeStub.window.errors.length, n, '连续失败只提示一次');
+    } finally {
+        if (cssPath) { try { fs.chmodSync(cssPath, 0o644); } catch (e) { /* 已删就算了 */ } }
+        vscodeStub.window.errors.length = 0;
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('状态文件损坏时保留原文件并告知,不静默清空', () => {
     const fs = require('node:fs');
     const vscodeStub = require('./vscode-stub.js');
