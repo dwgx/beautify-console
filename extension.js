@@ -225,11 +225,37 @@ function safeImageName(name) {
     return (stem || 'image') + (ext || '.png');
 }
 
+// 内嵌 base64 的单图上限。base64 膨胀约 1.33 倍,而这个 CSS 每次开窗都要被
+// Custom UI Style 读出来拼进 external.css —— 实测 4 张 2MB 图内嵌产出 37MB,
+// 三个区域各 4 张就是 112MB。超限的图跳过并提示,不能任其把编辑器拖死。
+const INLINE_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+const skippedInlineImages = new Set();
+
 // 单张图 → CSS url() 值。inline 为真时强制内联 base64(兜底开关)
 function imageCssUrl(absPath, inline) {
     if (!absPath) return '';
     if (!inline && canUseWorkbenchUrl(absPath)) return toWorkbenchUrl(absPath);
+    // 内嵌路径先看体积
+    try {
+        const size = fs.statSync(absPath).size;
+        if (size > INLINE_IMAGE_MAX_BYTES) {
+            skippedInlineImages.add(absPath);
+            // 扩展名允许的话退回直接引用,总比不显示好
+            return canUseWorkbenchUrl(absPath) ? toWorkbenchUrl(absPath) : '';
+        }
+    } catch (e) { /* 读不到大小就照旧尝试 */ }
     return imageToDataUri(toFileUrl(absPath));
+}
+
+// 生成后把跳过的图报给用户 —— 静默跳过会让人以为功能坏了
+function reportSkippedInlineImages() {
+    if (!skippedInlineImages.size) return;
+    const names = [...skippedInlineImages].map(p => path.basename(p));
+    skippedInlineImages.clear();
+    const limitMb = (INLINE_IMAGE_MAX_BYTES / 1048576).toFixed(0);
+    vscode.window.showWarningMessage(
+        `美化控制台: ${names.length} 张图超过 ${limitMb}MB,未内嵌(${names.slice(0, 3).join('、')}` +
+        `${names.length > 3 ? ' 等' : ''})。已改用直接引用 —— 内嵌会让 CSS 膨胀到上百 MB,每次开窗都要解析。`);
 }
 
 // ============================================================
@@ -439,6 +465,7 @@ function writeDynamicCss(animMode, bgMode, state) {
             parts.push(regionCss(key, { ...cfg, inline: st.inlineImages }));
         }
         if (parts.length) out += '/* ---- 多区域背景 ---- */\n' + parts.join('\n\n') + '\n';
+        reportSkippedInlineImages();
     }
     try { fs.writeFileSync(cusDynamicCss(), out); return true; } catch (e) { return false; }
 }
@@ -1328,6 +1355,7 @@ module.exports = {
     // 多区域背景 / 轮播
     REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
     imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss, safeImageName,
+    INLINE_IMAGE_MAX_BYTES,
     isCustomCssEnabled, panicDisableCustomCss, applyBg, readState, handleMessage, restoreDefaults,
     // 状态
     STATE_VERSION, stateFile, defaultState, sanitizeState, readBeautifyState, writeBeautifyState,

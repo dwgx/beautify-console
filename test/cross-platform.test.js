@@ -401,6 +401,33 @@ test('safeImageName 清洗掉能破坏 CSS 规则的字符', () => {
     assert.ok(ext.safeImageName('x'.repeat(200) + '.webp').length < 100, '过长名字应截断');
 });
 
+test('内嵌模式对超限图片设上限(否则 CSS 会涨到上百 MB)', () => {
+    const fs = require('node:fs');
+    const vscodeStub = require('./vscode-stub.js');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-cap-'));
+    try {
+        const limit = ext.INLINE_IMAGE_MAX_BYTES;
+        const small = path.join(tmp, 'small.png');
+        const big = path.join(tmp, 'big.png');
+        fs.writeFileSync(small, Buffer.alloc(1024, 1));
+        fs.writeFileSync(big, Buffer.alloc(limit + 1024, 1));
+
+        // 小图照常内嵌
+        assert.ok(ext.imageCssUrl(small, true).startsWith('data:'), '小图应内嵌');
+        // 超限图退回直接引用,而不是产出几十 MB 的 CSS
+        assert.ok(ext.imageCssUrl(big, true).startsWith('vscode-file:'), '超限图应退回直接引用');
+
+        // 实测:3 张 3MB 图内嵌无上限时约 12MB,有上限后只剩几 KB
+        vscodeStub.window.warnings.length = 0;
+        const css = ext.regionCss('editor', { images: [big, big, big], opacity: 0.22, intervalMs: 8000, inline: true });
+        assert.ok(css.length < 100 * 1024, `超限图不该进 CSS,实际 ${css.length} 字节`);
+        assert.ok(!/data:image/.test(css));
+    } finally {
+        vscodeStub.window.warnings.length = 0;
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('imageCssUrl 白名单外的扩展名退回 base64 内联', () => {
     assert.match(ext.imageCssUrl('/x/a.png'), /^vscode-file:\/\/vscode-app\//);
     // .tiff 不在 Electron 的 validExtensions 里,vscode-file 会被拒
