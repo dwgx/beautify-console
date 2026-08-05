@@ -50,6 +50,14 @@ function getUserDir() {
 // 本插件管理的两个 CSS 文件(路径随 userDir 动态解析,不能提前算成常量)
 const cusBaseCss = () => path.join(getUserDir(), 'cus-base.css');
 const cusDynamicCss = () => path.join(getUserDir(), 'cus-dynamic.css');
+// 用户手写的 CSS。本插件只创建、绝不覆盖 —— 它必须与生成的文件分开,
+// 因为 writeDynamicCss() 是整文件重写,放一起会被清掉。
+const cusCustomCss = () => path.join(getUserDir(), 'cus-custom.css');
+
+// 自定义 CSS 是否注入。关掉只是不登记进 imports,文件内容一律保留。
+function isCustomCssEnabled() {
+    return vscode.workspace.getConfiguration().get('beautify.customCss.enabled') !== false;
+}
 
 // 绝对路径 → file:// URL。pathToFileURL 会正确处理盘符与空格转义,
 // 且能被 Custom UI Style 内部的 fileURLToPath 原样还原。
@@ -66,16 +74,28 @@ function fromFileUrl(fileUrl) {
     catch (e) { return s; }
 }
 
+// 扩展名 → data URI 的 mime 子类型。白名单之外一律回落 png,
+// 绝不把文件名里的任意文本拼进 CSS。
+const DATA_URI_MIME = {
+    '.png': 'png', '.jpg': 'jpeg', '.jpeg': 'jpeg', '.webp': 'webp',
+    '.gif': 'gif', '.bmp': 'bmp', '.svg': 'svg+xml'
+};
+function dataUriMime(p) {
+    return DATA_URI_MIME[path.extname(String(p)).toLowerCase()] || 'png';
+}
+
 // 把本地图片转成 base64 data URI —— 绕过 workbench CSP 对 file:/// 的拦截(关键修复)
 function imageToDataUri(fileUrl) {
     try {
         if (!fileUrl || String(fileUrl).startsWith('data:')) return fileUrl;
         const p = fromFileUrl(fileUrl);
         if (!fs.existsSync(p)) return fileUrl; // 找不到就退回原路径
-        const ext = (path.extname(p).slice(1) || 'png').toLowerCase();
-        const mime = ext === 'jpg' ? 'jpeg' : ext;
+        // mime 只能取自白名单。扩展名来自文件名,直接拼进 data URI 的话,
+        // 形如 `a.x");}body{display:none}` 的文件就能闭合 CSS 字符串注入规则。
+        // 这一层独立于 safeImageName:导入的配置可以指向任何既有文件,
+        // 那些文件名从未经过清洗。
         const b64 = fs.readFileSync(p).toString('base64');
-        return `data:image/${mime};base64,${b64}`;
+        return `data:image/${dataUriMime(p)};base64,${b64}`;
     } catch (e) { return fileUrl; }
 }
 
@@ -142,6 +162,237 @@ function codeOnlyCss(bgUrl, opacity) {
     };
 }
 const CODE_ONLY_KEYS = Object.keys(codeOnlyCss('x', 0.92));
+
+// ============================================================
+// 多区域背景 —— 区域定义表
+// 选择器全部对 VS Code 1.131 的 workbench.desktop.main.css 核对过。
+// container 用 ::after 叠一层图;transparent 列出的子元素背景由 JS 写成内联
+// style.backgroundColor,只有 !important 压得过内联样式,否则图被完全盖住。
+// ============================================================
+const REGIONS = {
+    editor: {
+        label: '编辑器',
+        container: '.editor-group-container > .editor-container > .editor-instance',
+        // 刻意不做任何透明化。图层是 z-index:10 的 ::after 覆盖层,而
+        // .editor-instance / .monaco-editor 都不建立层叠上下文,所以它本来就画在
+        // 文字之上 —— 同仓库的 codeOnlyCss 用同一容器同一覆盖层、不带任何透明化,
+        // 注释注明「经真实 DOM 验证有效」。
+        // 曾经加过 `.monaco-editor, .monaco-editor .margin, .monaco-editor-background`,
+        // 那是重大误判:该选择器没有作用域,出货样式表里有 160 条规则给
+        // .monaco-editor 后代设背景且都不带 !important,于是被我们全部压过 ——
+        // peek view、notebook 单元格、输出面板、源代码管理提交框统统被抹平,
+        // 而用户只开了编辑器区的背景。
+        transparent: [],
+        defaultOpacity: 0.22
+    },
+    sidebar: {
+        label: '侧栏',
+        // .part > .content > .composite 是 workbench 的通用嵌套(侧栏的 composite
+        // 运行时还会带上 viewlet class,这里不依赖它,少一个失效点)
+        container: '.monaco-workbench .part.sidebar > .content > .composite',
+        transparent: [
+            '.monaco-workbench .part.sidebar',
+            '.monaco-workbench .part.sidebar .pane, .monaco-workbench .part.sidebar .pane-body',
+            '.monaco-workbench .part.sidebar .monaco-list-rows'
+        ],
+        defaultOpacity: 0.18
+    },
+    panel: {
+        label: '面板',
+        container: '.monaco-workbench .part.panel > .content > .composite',
+        // 注意这里的 .monaco-editor 系列【必须】带上 .part.panel 前缀:
+        // 不限定作用域会波及编辑器、peek view、notebook 等等(出货样式表里有 160
+        // 条规则给 .monaco-editor 后代设背景且都不带 !important)。
+        // 不列 .xterm-screen —— 出货声明只有 z-index:31,没有背景可覆盖;
+        // 而 .pane-body.integrated-terminal 本身已是 transparent !important。
+        transparent: [
+            '.monaco-workbench .part.panel',
+            '.monaco-workbench .part.panel > .content .monaco-editor, .monaco-workbench .part.panel > .content .monaco-editor .margin, .monaco-workbench .part.panel > .content .monaco-editor .monaco-editor-background'
+        ],
+        defaultOpacity: 0.18
+    }
+};
+const REGION_KEYS = Object.keys(REGIONS);
+
+// 绝对路径 → workbench 可加载的 URL。
+// 关键:workbench 自身从 vscode-file://vscode-app/ 加载,所以 CSP 的
+// `img-src 'self'` 覆盖该 origin;而 Electron 的协议校验是 OR ——
+// 路径在白名单目录下【或】扩展名在白名单里(.png/.jpg/.jpeg/.webp/.gif/.bmp/.svg),
+// 后者让磁盘任意位置的图片都能直接引用。因此不必内联 base64:
+// 12 张 2MB 壁纸内联要 33MB CSS,改成 URL 只要 1KB。
+const VSCODE_FILE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.svg'];
+function toWorkbenchUrl(absPath) {
+    const p = String(absPath).replace(/\\/g, '/');
+    return 'vscode-file://vscode-app' + (p.startsWith('/') ? '' : '/') + encodeURI(p).replace(/[?#]/g, encodeURIComponent);
+}
+
+// 图片是否能走 vscode-file(扩展名在 Electron 白名单内);否则退回 base64 内联
+function canUseWorkbenchUrl(absPath) {
+    return VSCODE_FILE_EXTS.includes(path.extname(String(absPath)).toLowerCase());
+}
+
+// 复制进 backgrounds/ 时清洗文件名。
+// 全窗口模式把路径交给 Custom UI Style,它按 `url('...')` 单引号拼接且不转义
+// (css.ts:31),而 pathToFileURL 不转义单引号 —— 于是名字里带 `')` 的图片会
+// 提前闭合这条规则,背景静默失效。本插件自己生成的 CSS 用双引号 + encodeURI
+// (双引号会被转成 %22)不受影响,但源头清洗掉最省事,两条路径一起保住。
+function safeImageName(name) {
+    // 先剥掉开头的点,否则 ".png" 会被 extname 当成无扩展名的隐藏文件,
+    // 清洗后变成 "_png" —— 扩展名没了,vscode-file 白名单也就命中不了。
+    const bare = String(name).replace(/^\.+/, '');
+    const rawExt = path.extname(bare).toLowerCase();
+    const stem = path.basename(bare, path.extname(bare))
+        .replace(/['"(){};\\\r\n]/g, '_')   // CSS url() / 规则语法里有特殊含义的字符
+        .slice(0, 80);
+    // 扩展名同样必须清洗,而且只认白名单。此前只洗了主干:名为
+    // `a.x");}body{display:none}` 的文件,扩展名会被原样带进
+    // `data:image/<扩展名>`,双引号闭合 CSS 字符串后即可注入任意规则。
+    const ext = VSCODE_FILE_EXTS.includes(rawExt) ? rawExt : '.png';
+    return (stem || 'image') + ext;
+}
+
+// 内嵌 base64 的单图上限。base64 膨胀约 1.33 倍,而这个 CSS 每次开窗都要被
+// Custom UI Style 读出来拼进 external.css —— 实测 4 张 2MB 图内嵌产出 37MB,
+// 三个区域各 4 张就是 112MB。超限的图跳过并提示,不能任其把编辑器拖死。
+const INLINE_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+const skippedInlineImages = new Set();
+
+// 把选中的图复制进 backgrounds/,返回目标绝对路径。
+// 目标名撞车时补序号:此前只按文件名落盘,选了 nature/bg.png 和 city/bg.png
+// 两张不同的图会写到同一个 bg.png,后者覆盖前者,列表里还只剩一条 ——
+// 「复制一份所以原图移动也不怕」这个承诺被自己后来的选图破坏掉了。
+// 内容相同则复用,避免重复选同一张图时越堆越多。
+function copyIntoBackgrounds(srcPath) {
+    try {
+        const dir = path.join(getUserDir(), 'backgrounds');
+        fs.mkdirSync(dir, { recursive: true });
+        const name = safeImageName(path.basename(srcPath));
+        const ext = path.extname(name);
+        const stem = path.basename(name, ext);
+        const src = fs.readFileSync(srcPath);
+        let dest = path.join(dir, name);
+        for (let i = 2; ; i++) {
+            if (!fs.existsSync(dest)) break;
+            // 已有同名文件:内容一致就直接复用,不一致才另起名字
+            try { if (fs.readFileSync(dest).equals(src)) return dest; } catch (e) { /* 读不了就改名 */ }
+            dest = path.join(dir, `${stem}-${i}${ext}`);
+        }
+        fs.writeFileSync(dest, src);
+        return dest;
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 复制图片失败 — ${e.message}`);
+        return null;
+    }
+}
+
+// 单张图 → CSS url() 值。inline 为真时强制内联 base64(兜底开关)
+function imageCssUrl(absPath, inline) {
+    if (!absPath) return '';
+    if (!inline && canUseWorkbenchUrl(absPath)) return toWorkbenchUrl(absPath);
+    // 走内联路径但文件不在:imageToDataUri 会原样退回 file:// URL,而那正是
+    // workbench CSP 拒绝加载的东西 —— CSS 里留下一条注定失败的规则。
+    // 返回空串,让 regionCss 把这张图整个滤掉,失败得干脆一点。
+    if (!fs.existsSync(absPath)) return '';
+    // 内嵌路径先看体积
+    try {
+        const size = fs.statSync(absPath).size;
+        if (size > INLINE_IMAGE_MAX_BYTES) {
+            skippedInlineImages.add(absPath);
+            // 扩展名允许的话退回直接引用,总比不显示好
+            return canUseWorkbenchUrl(absPath) ? toWorkbenchUrl(absPath) : '';
+        }
+    } catch (e) { /* 读不到大小就照旧尝试 */ }
+    return imageToDataUri(toFileUrl(absPath));
+}
+
+// 生成后把跳过的图报给用户 —— 静默跳过会让人以为功能坏了
+function reportSkippedInlineImages() {
+    if (!skippedInlineImages.size) return;
+    const names = [...skippedInlineImages].map(p => path.basename(p));
+    skippedInlineImages.clear();
+    const limitMb = (INLINE_IMAGE_MAX_BYTES / 1048576).toFixed(0);
+    vscode.window.showWarningMessage(
+        `美化控制台: ${names.length} 张图超过 ${limitMb}MB,未内嵌(${names.slice(0, 3).join('、')}` +
+        `${names.length > 3 ? ' 等' : ''})。已改用直接引用 —— 内嵌会让 CSS 膨胀到上百 MB,每次开窗都要解析。`);
+}
+
+// ============================================================
+// 轮播 keyframes 生成
+// 原理:background-image 是离散属性,不做插值,只在关键帧处突变。
+// 所以把换图放在 opacity=0 的那一帧,换图动作就看不见,单层伪元素即可淡入淡出。
+// 已在真实浏览器实测:3 图 / 210 次采样 / 4 次换图,换图时刻 opacity 最高
+// 0.0246(上限 0.22 的 11%),无硬切。
+// 注意 opacity 只能在 0..maxOpacity 之间动,maxOpacity 就是该区域配置的不透明度,
+// 不能动到 1,否则轮播时图会比静态时浓。
+// ============================================================
+const CAROUSEL_FADE_RATIO = 0.25;   // 淡入淡出各占单张时长的比例
+
+function carouselKeyframes(name, urls, maxOpacity, fadeRatio) {
+    const n = urls.length;
+    const slot = 100 / n;
+    const fade = slot * (fadeRatio == null ? CAROUSEL_FADE_RATIO : fadeRatio);
+    const op = maxOpacity;
+    const frames = [];
+    for (let i = 0; i < n; i++) {
+        const start = i * slot;
+        const img = `background-image: url("${urls[i]}")`;
+        frames.push(`    ${+start.toFixed(4)}% { ${img}; opacity: 0; }`);
+        frames.push(`    ${+(start + fade).toFixed(4)}% { ${img}; opacity: ${op}; }`);
+        frames.push(`    ${+(start + slot - fade).toFixed(4)}% { ${img}; opacity: ${op}; }`);
+    }
+    // 收尾帧回到第一张,让 linear infinite 无缝接上
+    frames.push(`    100% { background-image: url("${urls[0]}"); opacity: 0; }`);
+    return `@keyframes ${name} {\n${frames.join('\n')}\n}`;
+}
+
+// 单个区域的完整 CSS:透明化子元素 + ::after 图层(静态或轮播)
+// cfg: { images: string[], opacity: number, intervalMs: number, blend: boolean, inline: boolean }
+function regionCss(key, cfg) {
+    const region = REGIONS[key];
+    if (!region || !cfg || !cfg.images || !cfg.images.length) return '';
+    const urls = cfg.images.map(p => imageCssUrl(p, cfg.inline)).filter(Boolean);
+    if (!urls.length) return '';
+
+    const opacity = typeof cfg.opacity === 'number' ? cfg.opacity : region.defaultOpacity;
+    const out = [`/* ---- ${region.label} ---- */`];
+
+    // 子元素透明化 —— 必须 !important,背景色是内联样式写上去的
+    for (const sel of region.transparent) {
+        out.push(`${sel} { background-color: transparent !important; }`);
+    }
+
+    out.push(`${region.container} { position: relative !important; }`);
+
+    // 每条都带 !important:Custom UI Style 把 external.css 注入在
+    // workbench.desktop.main.css【之前】(已在本机 workbench.html 核对:1313 vs 1415),
+    // 所以同优先级下 VS Code 一律胜出。VS Code 自己也在 workbench 元素上用 ::after
+    // (如 .title.title-border-bottom:after),将来它给我们这些容器加一条就会盖掉我们。
+    const layer = [
+        `content: '' !important`, `position: absolute !important`,
+        `top: 0 !important`, `left: 0 !important`,
+        `width: 100% !important`, `height: 100% !important`,
+        `z-index: 10 !important`, `pointer-events: none !important`,
+        `background-position: center center !important`,
+        `background-repeat: no-repeat !important`,
+        `background-size: cover !important`
+    ];
+    // 深色主题下 screen 混合让图与底色自然融合;浅色主题会发白,故可关
+    if (cfg.blend) layer.push(`mix-blend-mode: screen !important`);
+
+    if (urls.length === 1) {
+        layer.push(`background-image: url("${urls[0]}") !important`, `opacity: ${opacity} !important`);
+        out.push(`${region.container}::after {\n    ${layer.join(';\n    ')};\n}`);
+    } else {
+        const anim = `beautify-carousel-${key}`;
+        const dur = Math.max(1, Math.round((cfg.intervalMs || 8000) * urls.length / 1000));
+        layer.push(`animation: ${anim} ${dur}s linear infinite !important`);
+        out.push(`${region.container}::after {\n    ${layer.join(';\n    ')};\n}`);
+        out.push(carouselKeyframes(anim, urls, opacity));
+        // 系统要求减少动效时停在第一张,不要闪
+        out.push(`@media (prefers-reduced-motion: reduce) {\n    ${region.container}::after {\n        animation: none !important;\n        background-image: url("${urls[0]}") !important;\n        opacity: ${opacity} !important;\n    }\n}`);
+    }
+    return out.join('\n');
+}
 
 async function reloadCUS() {
     try { await vscode.commands.executeCommand('custom-ui-style.reload'); }
@@ -250,19 +501,47 @@ function getCodeOpacity() {
 }
 
 // 生成并写入 cus-dynamic.css;用注释标记当前 animMode / bgMode 供 readState 读取
-function writeDynamicCss(animMode, bgMode) {
+// state 可选:bgMode 为 'regions' 时用它生成多区域段,不传则从状态文件读。
+function writeDynamicCss(animMode, bgMode, state) {
     const bgUrl = getChosenImage();
     let out = `/* 由美化控制台动态生成,勿手改 */\n/* ANIM:${animMode} */\n/* BG:${bgMode} */\n\n`;
     // 动画段
     const anim = ANIM_PRESETS[animMode] || {};
     if (Object.keys(anim).length) out += '/* ---- 动画 ---- */\n' + cssFromObj(anim) + '\n\n';
-    // 仅代码区背景段(图转 base64 绕过 CSP;用专属的 codeOpacity)
+    // 仅代码区背景段(旧模式,保留:图转 base64 绕过 CSP;用专属的 codeOpacity)
     if (bgMode === 'codeOnly' && bgUrl) {
         const dataUri = imageToDataUri(bgUrl);
         out += '/* ---- 仅代码区背景 ---- */\n' + cssFromObj(codeOnlyCss(dataUri, getCodeOpacity())) + '\n';
     }
-    try { fs.writeFileSync(cusDynamicCss(), out); return true; } catch (e) { return false; }
+    // 多区域段:各区域独立图 / 不透明度 / 轮播
+    if (bgMode === 'regions') {
+        const st = state || readBeautifyState();
+        const parts = [];
+        for (const key of REGION_KEYS) {
+            const cfg = st.regions[key];
+            if (!cfg || !cfg.images.length) continue;
+            parts.push(regionCss(key, { ...cfg, inline: st.inlineImages }));
+        }
+        if (parts.length) out += '/* ---- 多区域背景 ---- */\n' + parts.join('\n\n') + '\n';
+        reportSkippedInlineImages();
+    }
+    // 写失败必须报出来。此前 11 个调用点全都丢掉返回值,而 writeBeautifyState
+    // 是会报错的 —— 这个不对称造成:CSS 文件只读时,状态文件写成了(记着已清空)、
+    // CSS 没写成(图还在),面板照常提示成功,重启后图依然在,且此后永久如此。
+    try {
+        fs.writeFileSync(cusDynamicCss(), out);
+        dynamicCssWriteFailed = false;
+        return true;
+    } catch (e) {
+        if (!dynamicCssWriteFailed) {
+            dynamicCssWriteFailed = true;   // 连续失败只提示一次,避免拖滑块时刷屏
+            vscode.window.showErrorMessage(
+                `美化控制台: 样式文件写入失败,改动不会生效 — ${e.message}`);
+        }
+        return false;
+    }
 }
+let dynamicCssWriteFailed = false;
 
 // 从 cus-dynamic.css 的标记注释读当前模式
 function readDynamicModes() {
@@ -271,6 +550,279 @@ function readDynamicModes() {
         const a = c.match(/ANIM:(\w+)/); const b = c.match(/BG:(\w+)/);
         return { animMode: a ? a[1] : 'default', bgModeCss: b ? b[1] : 'off' };
     } catch (e) { return { animMode: 'default', bgModeCss: 'off' }; }
+}
+
+// ============================================================
+// 状态文件 —— 多区域 / 轮播的配置装不进注释标记,改用 JSON
+// 旧状态(单图 .beautify-bg-image + cus-dynamic.css 的 ANIM:/BG: 注释)仍然
+// 是唯一来源直到这里迁移一次;迁移后依旧继续写那两个注释,让 readDynamicModes
+// 和任何还在读旧格式的路径不受影响。
+// ============================================================
+const STATE_VERSION = 1;
+const stateFile = () => path.join(getUserDir(), 'beautify-state.json');
+
+function defaultRegionCfg(key) {
+    return { images: [], opacity: REGIONS[key].defaultOpacity, intervalMs: 8000, blend: true };
+}
+
+function defaultState() {
+    const regions = {};
+    for (const k of REGION_KEYS) regions[k] = defaultRegionCfg(k);
+    return { version: STATE_VERSION, animMode: 'default', bgMode: 'off', regions, inlineImages: false };
+}
+
+// 从旧格式迁移:单张图归到 editor 区域,模式沿用注释标记
+function migrateLegacyState() {
+    const st = defaultState();
+    const modes = readDynamicModes();
+    st.animMode = modes.animMode;
+    const legacyImg = getChosenImage();
+    if (legacyImg) {
+        const abs = fromFileUrl(legacyImg);
+        if (modes.bgModeCss === 'codeOnly') {
+            st.bgMode = 'codeOnly';
+            st.regions.editor.images = [abs];
+            st.regions.editor.opacity = getCodeOpacity();
+        } else if (vscode.workspace.getConfiguration().get('custom-ui-style.background.url')) {
+            st.bgMode = 'full';
+        }
+    }
+    return st;
+}
+
+// 校验并规范化任意来源的状态对象(状态文件被手改、或从别人那儿导入的配置)。
+// 只接受白名单内的键与合法取值,其余一律丢弃 —— 这些值会被写进注入的 CSS,
+// 不能信。返回 { state, rejected } 便于向用户交代哪些项被丢了。
+const ANIM_MODES = ['default', 'smooth', 'bounce', 'fancy', 'off'];
+const BG_MODES = ['off', 'full', 'codeOnly', 'regions'];
+
+// 路径在【任一】平台上是绝对路径就算过。
+// path.isAbsolute 绑在宿主平台上:`C:\Users\bob\a.png` 在 POSIX 上不算绝对路径,
+// 于是从 Windows 导出的配置在 macOS 上会被判成「不合法」并丢弃,用户看到的是
+// 「3 项不合法」而不是「本机不存在」—— 措辞与事实不符。放宽这一层,
+// 存在性交给 fs.existsSync 判,措辞就对了。相对路径仍然拒收,
+// 它会相对 workbench 解析到 app bundle 内部。
+function isAbsoluteAnyPlatform(p) {
+    return path.isAbsolute(p) || path.win32.isAbsolute(p) || path.posix.isAbsolute(p);
+}
+
+function sanitizeState(raw) {
+    const st = defaultState();
+    const rejected = [];
+    if (!raw || typeof raw !== 'object') return { state: st, rejected: ['整个文件不是对象'] };
+
+    if (ANIM_MODES.includes(raw.animMode)) st.animMode = raw.animMode;
+    else if (raw.animMode !== undefined) rejected.push(`animMode=${JSON.stringify(raw.animMode)}`);
+
+    if (BG_MODES.includes(raw.bgMode)) st.bgMode = raw.bgMode;
+    else if (raw.bgMode !== undefined) rejected.push(`bgMode=${JSON.stringify(raw.bgMode)}`);
+
+    st.inlineImages = raw.inlineImages === true;
+
+    const rawRegions = (raw.regions && typeof raw.regions === 'object') ? raw.regions : {};
+    for (const k of REGION_KEYS) {
+        const src = rawRegions[k];
+        if (!src || typeof src !== 'object') continue;
+        const dst = st.regions[k];
+        // 图片路径:必须是绝对路径字符串。相对路径会相对 workbench 解析,指向
+        // app bundle 内部,既无效也不该允许。
+        if (Array.isArray(src.images)) {
+            for (const p of src.images) {
+                if (typeof p === 'string' && p && isAbsoluteAnyPlatform(p)) dst.images.push(p);
+                else rejected.push(`${k}.images 里的 ${JSON.stringify(p)}`);
+            }
+        }
+        if (typeof src.opacity === 'number' && src.opacity >= 0 && src.opacity <= 1) dst.opacity = src.opacity;
+        else if (src.opacity !== undefined) rejected.push(`${k}.opacity=${JSON.stringify(src.opacity)}`);
+        // 间隔下限 1s:再短会让 CSS 动画疯狂重绘
+        if (typeof src.intervalMs === 'number' && src.intervalMs >= 1000 && src.intervalMs <= 3600000) dst.intervalMs = src.intervalMs;
+        else if (src.intervalMs !== undefined) rejected.push(`${k}.intervalMs=${JSON.stringify(src.intervalMs)}`);
+        dst.blend = src.blend !== false;
+    }
+    return { state: st, rejected };
+}
+
+// 自举的完成信号。命令与面板消息都要先等它,否则会与首次安装的默认值写入打架。
+let bootstrapDone = Promise.resolve();
+
+// 已经就损坏文件提示过没有 —— 每次读都弹一次会刷屏
+let corruptStateReported = false;
+
+function readBeautifyState() {
+    let text = null;
+    try { text = fs.readFileSync(stateFile(), 'utf8'); }
+    catch (e) { return migrateLegacyState(); }   // 文件不存在 = 首次运行,静默迁移
+    try {
+        const st = sanitizeState(JSON.parse(text)).state;
+        // 读到好文件就复位:用户修好之后再次损坏,应该再提示一次
+        corruptStateReported = false;
+        return st;
+    } catch (e) {
+        // 文件在但解析不了(写入中崩溃 / 磁盘满 / 同步冲突)。此前这里静默回落到
+        // 默认值,下一次面板操作就把空状态写回磁盘,各区域用了哪些图、什么不透明度
+        // 和间隔全部永久丢失且毫无提示。现在把原文件挪到一边并告知。
+        if (!corruptStateReported) {
+            corruptStateReported = true;
+            let kept = null;
+            try {
+                kept = uniqueBackupPath(stateFile(), '.corrupt');
+                fs.renameSync(stateFile(), kept);
+            } catch (e2) { kept = null; }
+            vscode.window.showWarningMessage(
+                '美化控制台: 状态文件损坏,已回落到默认设置。' +
+                (kept ? `原文件保留为 ${path.basename(kept)},可手工找回区域配置。` : ''));
+        }
+        return migrateLegacyState();
+    }
+}
+
+// ============================================================
+// 配置导出 / 导入
+// 配置散在三处:VS Code 设置键、cus-base.css 的 --r、状态文件。
+// 导出把三者收进一个 JSON;导入时全部走 sanitize,不采信任何字段。
+// 图片按绝对路径引用而非内嵌 —— 内嵌会让文件大到无法分享(12 张 2MB 图 = 33MB),
+// 且人也没法手改。导入时逐个检查存在性,缺图明确报出来。
+// ============================================================
+const EXPORT_KIND = 'beautify-console-config';
+
+// 备份路径:时间戳只到毫秒,两次快速导入会落在同一毫秒上把前一份覆盖掉,
+// 所以撞名时补序号,确保每次替换都留得下来。
+function uniqueBackupPath(base, suffix) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const ext = suffix || '.bak';
+    let p = `${base}.${stamp}${ext}`;
+    for (let i = 2; fs.existsSync(p); i++) p = `${base}.${stamp}-${i}${ext}`;
+    return p;
+}
+
+// 导出会带上的 VS Code 设置键 → 允许的值类型。
+// 类型必须写死,不能拿 cfg.get() 的当前值去比 —— 键在本机没设过时当前值是
+// undefined,那样校验会被整个跳过,字符串就能写进 number 型的键里。
+// 少数键 VS Code 本身接受多种类型(如 fontLigatures 可为 bool 或字符串),写成数组。
+const EXPORTED_SETTINGS_TYPES = {
+    'editor.fontFamily': 'string',
+    'editor.fontSize': 'number',
+    'editor.lineHeight': 'number',
+    'editor.fontWeight': ['string', 'number'],
+    'editor.fontLigatures': ['boolean', 'string'],
+    'workbench.statusBar.visible': 'boolean',
+    'breadcrumbs.enabled': 'boolean',
+    'workbench.activityBar.location': 'string',
+    'window.menuBarVisibility': 'string',
+    'workbench.editor.tabSizing': 'string',
+    'editor.cursorSmoothCaretAnimation': ['string', 'boolean'],
+    'editor.smoothScrolling': 'boolean',
+    'editor.bracketPairColorization.enabled': 'boolean',
+    'editor.guides.indentation': 'boolean',
+    'editor.stickyScroll.enabled': 'boolean',
+    'editor.minimap.enabled': 'boolean',
+    'editor.padding.top': 'number',
+    'editor.padding.bottom': 'number',
+    'workbench.colorTheme': 'string',
+    'workbench.iconTheme': 'string',
+    'workbench.productIconTheme': 'string',
+    'terminal.integrated.fontFamily': 'string',
+    'custom-ui-style.background.opacity': 'number',
+    'beautify.codeOpacity': 'number'
+};
+const EXPORTED_SETTINGS = Object.keys(EXPORTED_SETTINGS_TYPES);
+
+function settingTypeOk(key, value) {
+    const want = EXPORTED_SETTINGS_TYPES[key];
+    if (!want) return false;
+    const list = Array.isArray(want) ? want : [want];
+    if (!list.includes(typeof value)) return false;
+    // number 型不接受 NaN / Infinity —— 写进 CSS 会产出非法值
+    if (typeof value === 'number' && !Number.isFinite(value)) return false;
+    return true;
+}
+
+function exportConfig() {
+    const cfg = vscode.workspace.getConfiguration();
+    const settings = {};
+    for (const k of EXPORTED_SETTINGS) {
+        const v = cfg.get(k);
+        if (v !== undefined) settings[k] = v;
+    }
+    let customCss = '';
+    try { customCss = fs.readFileSync(cusCustomCss(), 'utf8'); } catch (e) { /* 没有就空 */ }
+    return {
+        kind: EXPORT_KIND,
+        version: STATE_VERSION,
+        exportedAt: new Date().toISOString(),
+        radius: getRadius(),
+        settings,
+        state: readBeautifyState(),
+        customCss
+    };
+}
+
+// 导入:校验 → 应用。返回 { applied, rejected, missingImages, failedKeys }
+async function importConfig(raw) {
+    if (!raw || typeof raw !== 'object') throw new Error('文件内容不是 JSON 对象');
+    if (raw.kind !== EXPORT_KIND) throw new Error(`不是美化控制台的配置文件(kind=${JSON.stringify(raw.kind)})`);
+
+    const { state, rejected } = sanitizeState(raw.state);
+    // 缺图不阻断导入 —— 别人机器上的路径在本机大概率不存在,但其余配置仍有价值
+    const missingImages = [];
+    for (const k of REGION_KEYS) {
+        state.regions[k].images = state.regions[k].images.filter(p => {
+            if (fs.existsSync(p)) return true;
+            missingImages.push(p);
+            return false;
+        });
+    }
+
+    // 设置键:只认白名单内的键,值类型必须与当前值一致(或当前无值)
+    const updates = [];
+    const rawSettings = (raw.settings && typeof raw.settings === 'object') ? raw.settings : {};
+    const cfg = vscode.workspace.getConfiguration();
+    for (const k of EXPORTED_SETTINGS) {
+        if (!(k in rawSettings)) continue;
+        const v = rawSettings[k];
+        if (!settingTypeOk(k, v)) { rejected.push(`${k}=${JSON.stringify(v)} 类型不符`); continue; }
+        updates.push([k, v]);
+    }
+    for (const k of Object.keys(rawSettings)) {
+        if (!EXPORTED_SETTINGS.includes(k)) rejected.push(`未知设置键 ${k}`);
+    }
+    const failedKeys = await setConfig(updates);
+
+    if (typeof raw.radius === 'number' && raw.radius >= 0 && raw.radius <= 40) setRadius(Math.round(raw.radius));
+    else if (raw.radius !== undefined) rejected.push(`radius=${JSON.stringify(raw.radius)}`);
+
+    // 自定义 CSS 属于用户资产。备份必须带时间戳:固定的 .bak 会被下一次导入
+    // 覆盖,连导两次原文就彻底没了(实测:第二次导入后 .bak 里是第一次导入的内容)。
+    let customCssReplaced = null;
+    if (typeof raw.customCss === 'string') {
+        try {
+            let old = '';
+            try { old = fs.readFileSync(cusCustomCss(), 'utf8'); } catch (e) { /* 没有就当空 */ }
+            if (old !== raw.customCss) {
+                if (old.trim()) {
+                    const bak = uniqueBackupPath(cusCustomCss());
+                    fs.copyFileSync(cusCustomCss(), bak);
+                    customCssReplaced = path.basename(bak);
+                }
+                fs.writeFileSync(cusCustomCss(), raw.customCss);
+            }
+        } catch (e) { rejected.push(`自定义 CSS 写入失败: ${e.message}`); }
+    }
+
+    writeBeautifyState(state);
+    writeDynamicCss(state.animMode, state.bgMode, state);
+    return { applied: true, rejected, missingImages, failedKeys, customCssReplaced };
+}
+
+function writeBeautifyState(st) {
+    try {
+        fs.mkdirSync(getUserDir(), { recursive: true });
+        fs.writeFileSync(stateFile(), JSON.stringify(st, null, 2));
+        return true;
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 状态保存失败 — ${e.message}`);
+        return false;
+    }
 }
 
 // 常见编程字体候选(展示名 → 文件名关键字列表,用于检测是否已装)
@@ -398,7 +950,9 @@ function readState() {
     let bgMode = 'off';
     if (fullUrl) bgMode = 'full';
     else if (dyn.bgModeCss === 'codeOnly') bgMode = 'codeOnly';
+    else if (dyn.bgModeCss === 'regions') bgMode = 'regions';
     const bgUrl = getChosenImage();   // 面板显示用:当前选定的图(独立于模式)
+    const bst = readBeautifyState();  // 多区域配置的唯一来源
     return {
         fontFamily: c.get('editor.fontFamily'),
         fontName: currentFontName(c.get('editor.fontFamily')),
@@ -423,8 +977,12 @@ function readState() {
         bgMode,
         bgUrl,
         // 按模式返回对应透明度:全窗口用 background.opacity(0.7~1),仅代码区用 codeOpacity(0.05~0.6)
-        bgOpacity: bgMode === 'codeOnly' ? getCodeOpacity() : (c.get('custom-ui-style.background.opacity') || 0.92),
-        codeMode: bgMode === 'codeOnly',
+        // 全窗口用 CUS 的 background.opacity(0.7~1);仅代码区与多区域是叠在
+        // 内容上的图层,取值低得多(0.05~0.8),滑块范围必须跟着换。
+        bgOpacity: bgMode === 'codeOnly' ? getCodeOpacity()
+            : bgMode === 'regions' ? Math.max(...REGION_KEYS.map(k => bst.regions[k].opacity))
+            : (c.get('custom-ui-style.background.opacity') || 0.92),
+        lowOpacityMode: bgMode === 'codeOnly' || bgMode === 'regions',
         radius: getRadius(),
         colorTheme: c.get('workbench.colorTheme'),
         iconTheme: c.get('workbench.iconTheme'),
@@ -432,7 +990,12 @@ function readState() {
         themes: listThemes('color'),
         iconThemes: listThemes('icon'),
         productThemes: listThemes('product'),
-        platform: process.platform
+        platform: process.platform,
+        // 多区域 / 自定义 CSS
+        regions: bst.regions,
+        regionMeta: REGION_KEYS.map(k => ({ key: k, label: REGIONS[k].label, defaultOpacity: REGIONS[k].defaultOpacity })),
+        inlineImages: bst.inlineImages,
+        customCssEnabled: isCustomCssEnabled()
     };
 }
 
@@ -440,7 +1003,7 @@ function readState() {
 const initDoneFile = () => path.join(getUserDir(), '.beautify-init-done');
 
 // 本插件在 imports 里管理的文件名 —— 用于剔除其它机器同步过来的旧条目
-const MANAGED_CSS_NAMES = ['cus-base.css', 'cus-dynamic.css'];
+const MANAGED_CSS_NAMES = ['cus-base.css', 'cus-dynamic.css', 'cus-custom.css'];
 
 // settings.json 会被 Settings Sync 同步,于是 Windows 上写的
 // `file://C:/Users/xxx/AppData/...` 会跟到 macOS/Linux。这些路径在本机
@@ -475,7 +1038,19 @@ async function bootstrap() {
         }
         const cfg = vscode.workspace.getConfiguration();
         const imports = cfg.get('custom-ui-style.external.imports') || [];
+        // 必须先落盘再登记:缺文件不会被静默跳过 —— Custom UI Style 读取失败会
+        // 弹错误通知并强制打开输出面板(external.ts:141 → utils.ts:160),每次
+        // reload 都来一遍。
+        if (!fs.existsSync(cusCustomCss())) {
+            fs.writeFileSync(cusCustomCss(),
+                '/* 自定义 CSS —— 美化控制台不会覆盖此文件。\n' +
+                '   改动后需运行 "Custom UI Style: Reload"(macOS 会整个退出重开)。*/\n');
+        }
+        // cus-custom.css 放最后:external.imports 按数组顺序合并,靠后者在同
+        // 优先级下胜出,用户手写规则才能压过我们生成的。
+        // 被紧急关闭时不登记它 —— 文件留着,用户写的东西不丢。
         const need = [toFileUrl(cusBaseCss()), toFileUrl(cusDynamicCss())];
+        if (isCustomCssEnabled()) need.push(toFileUrl(cusCustomCss()));
         const kept = imports.filter(im => !isStaleManagedImport(im, need));
         let changed = kept.length !== imports.length;
         for (const im of need) if (!kept.includes(im)) { kept.push(im); changed = true; }
@@ -484,10 +1059,14 @@ async function bootstrap() {
             await cfg.update('custom-ui-style.external.loadStrategy', 'refetch', vscode.ConfigurationTarget.Global);
             await cfg.update('custom-ui-style.reloadWithoutPrompting', true, vscode.ConfigurationTarget.Global);
         }
-        // 首次安装:自动应用 JetBrains 默认参数
+        // 首次安装:自动应用 JetBrains 默认参数。
+        // 标记必须在应用默认值【之前】写:applyJetBrainsDefaults 末尾会 reloadCUS,
+        // 而 macOS 上那是整个应用退出重开 —— 标记写在它之后就可能永远写不成,
+        // 于是每次启动都重跑一遍默认值,把用户后来的改动持续覆盖回去。
+        // 宁可漏应用一次默认值,也不能陷入这种循环。
         if (!fs.existsSync(initDoneFile())) {
-            await applyJetBrainsDefaults();
             fs.writeFileSync(initDoneFile(), new Date().toISOString());
+            await applyJetBrainsDefaults();
         }
     } catch (e) {
         // 自举失败会导致整个面板无声失效,必须让用户看见原因
@@ -524,13 +1103,19 @@ async function applyJetBrainsDefaults() {
     setRadius(8);
     await setConfig([['custom-ui-style.background.opacity', 0.92]]);
     writeDynamicCss('default', 'off');
-    await reloadCUS();
+    // 不 await:reloadCUS 在 macOS 上会退出并重开应用,它的 promise 可能永远不
+    // resolve。而 bootstrapDone 要用来给面板消息放行,把 reload 算进去的话
+    // 一旦它挂住,整个面板就无响应且毫无提示。写入已完成,reload 交出去即可。
+    reloadCUS();
 }
 
 function activate(context) {
     let panel = null;
     resolveUserDir(context);   // 必须在 bootstrap 之前:所有文件路径都依赖它
-    bootstrap();
+    // 不 await:activate 不该被 22 次设置写入拖住。但命令必须等它跑完再动手 ——
+    // 首次安装时 applyJetBrainsDefaults 正在逐条写默认值,用户此刻拖字号会先被
+    // 提示「已实时应用」,随后被默认值覆盖回去。
+    bootstrapDone = bootstrap();
 
     context.subscriptions.push(vscode.commands.registerCommand('beautify.openPanel', () => {
         if (panel) { panel.dispose(); panel = null; } // 强制重建,保证最新 HTML
@@ -550,8 +1135,49 @@ function activate(context) {
     context.subscriptions.push(
         vscode.commands.registerCommand('bgSwitcher.fullWindow', () => applyBg('full')),
         vscode.commands.registerCommand('bgSwitcher.codeOnly', () => applyBg('codeOnly')),
-        vscode.commands.registerCommand('bgSwitcher.off', () => applyBg('off'))
+        vscode.commands.registerCommand('bgSwitcher.off', () => applyBg('off')),
+        vscode.commands.registerCommand('beautify.panicDisableCustomCss', panicDisableCustomCss),
+        vscode.commands.registerCommand('beautify.openCustomCss', openCustomCss)
     );
+}
+
+// ============================================================
+// 自定义 CSS 的逃生门
+// 用户 CSS 能把 workbench 整个弄成 display:none,连命令面板(.quick-input-widget)
+// 也一起藏掉。但 CSS 破坏的是渲染、不是 JS —— 键绑定由 window 层监听处理,
+// 不依赖任何元素可见,所以绑了快捷键的命令在界面全黑时依然能触发。
+// 这是首要逃生手段;命令面板可能已经不可用,不能只靠它。
+// 注意 code --disable-extensions 救不了:CUS 的补丁是写进 VS Code 自身文件的,
+// 禁用扩展不会还原已落盘的改动。
+// ============================================================
+async function panicDisableCustomCss() {
+    await setConfig([['beautify.customCss.enabled', false]]);
+    const cfg = vscode.workspace.getConfiguration();
+    const imports = (cfg.get('custom-ui-style.external.imports') || [])
+        .filter(im => im !== toFileUrl(cusCustomCss()));
+    await cfg.update('custom-ui-style.external.imports', imports, vscode.ConfigurationTarget.Global);
+    vscode.window.showInformationMessage(
+        '已关闭自定义 CSS(文件内容保留在 cus-custom.css)。正在重载以恢复界面。');
+    await reloadCUS();
+}
+
+// 在编辑器里打开 cus-custom.css,并说清它需要什么才能生效
+async function openCustomCss() {
+    try {
+        fs.mkdirSync(getUserDir(), { recursive: true });
+        if (!fs.existsSync(cusCustomCss())) fs.writeFileSync(cusCustomCss(), '');
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(cusCustomCss()));
+        await vscode.window.showTextDocument(doc);
+        // 没有文件监听,改完必须显式重载;macOS 上那是整个应用退出重开
+        // Custom UI Style 的 restartApp 在 darwin / win32 / Linux 三条分支上
+        // 都是退出并重新拉起应用,不是 Reload Window。此前只警告了 macOS,
+        // 让 Windows / Linux 用户以为只是刷新窗口。
+        const hint = '改完点「应用并重载」—— 会完全退出并重新打开 VS Code(不是刷新窗口)。';
+        vscode.window.showInformationMessage(
+            `${hint} 写坏界面时按 ${process.platform === 'darwin' ? 'Cmd' : 'Ctrl'}+Alt+Shift+F12 一键关闭自定义 CSS。`);
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 打开自定义 CSS 失败 — ${e.message}`);
+    }
 }
 
 const DEFAULT_BG = '';
@@ -568,20 +1194,107 @@ function setChosenImage(url) {
 // 背景模式应用 —— 全窗口用 background.url;仅代码区写进 cus-dynamic.css;动画保持
 async function applyBg(mode, noReload) {
     const bgUrl = getChosenImage();
-    const animMode = readDynamicModes().animMode;
+    // 动画档位必须在 await 之后再读:在等待设置写入的窗口里用户若改了动画档位,
+    // 用开头读到的旧值重写 CSS 会把那次改动抹掉(状态文件与 CSS 标记还会不一致)。
+    const animMode = () => readDynamicModes().animMode;
     if (mode === 'full') {
         // 全窗口:CUS 内建背景显示;dynamic css 只留动画(bg=off)
         warnFailed(await setConfig([['custom-ui-style.background.url', bgUrl]]));
-        writeDynamicCss(animMode, 'off');
+        writeDynamicCss(animMode(), 'off');
     } else if (mode === 'codeOnly') {
         // 仅代码区:清 url,把背景 CSS 写进 dynamic css
         warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
-        writeDynamicCss(animMode, 'codeOnly');
+        writeDynamicCss(animMode(), 'codeOnly');
+    } else if (mode === 'regions') {
+        // 多区域:清 url,各区域 CSS 由状态文件驱动。模式要落进状态,
+        // 否则下次读状态又回到 off,面板上的选择白点。
+        warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
+        const st = readBeautifyState();
+        st.bgMode = 'regions';
+        st.animMode = animMode();
+        writeBeautifyState(st);
+        writeDynamicCss(st.animMode, 'regions', st);
     } else {
         warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
-        writeDynamicCss(animMode, 'off');
+        const st = readBeautifyState();
+        st.bgMode = 'off';
+        writeBeautifyState(st);
+        writeDynamicCss(animMode(), 'off');
     }
     if (!noReload) await reloadCUS();
+}
+
+// 取区域配置,区域名必须在白名单内。
+// 直接用 st.regions[msg.region] 会被 "__proto__" 命中原型:实测
+// {type:'regionOpacity', region:'__proto__', value:0.5} 会让
+// Object.prototype.opacity 变成 0.5,宿主进程里每个普通对象都带上它。
+// 消息来自我们自己的 webview,不算外部输入,但污染是进程级的,不该留。
+function regionCfgOf(st, key) {
+    if (!REGION_KEYS.includes(key)) throw new Error(`未知区域 ${key}`);
+    return st.regions[key];
+}
+
+// 存状态 → 重写 CSS → 刷新面板 → 标记待重启。多区域的每次改动都走这里。
+function applyRegionState(st, panel) {
+    writeBeautifyState(st);
+    writeDynamicCss(st.animMode, st.bgMode, st);
+    if (panel) panel.webview.postMessage({ type: 'init', state: readState() });
+    markRestart(panel);
+}
+
+// 按开关同步 cus-custom.css 在 imports 里的登记状态
+async function syncCustomCssImport() {
+    const cfg = vscode.workspace.getConfiguration();
+    const url = toFileUrl(cusCustomCss());
+    const imports = (cfg.get('custom-ui-style.external.imports') || []).filter(im => im !== url);
+    // 启用时追加到末尾 —— 顺序决定优先级,用户规则要压过我们生成的
+    if (isCustomCssEnabled()) imports.push(url);
+    await cfg.update('custom-ui-style.external.imports', imports, vscode.ConfigurationTarget.Global);
+}
+
+async function doExportConfig() {
+    const uri = await vscode.window.showSaveDialog({
+        filters: { JSON: ['json'] },
+        saveLabel: '导出',
+        defaultUri: vscode.Uri.file(path.join(os.homedir(), 'beautify-config.json'))
+    });
+    if (!uri) return;
+    try {
+        fs.writeFileSync(uri.fsPath, JSON.stringify(exportConfig(), null, 2));
+        vscode.window.showInformationMessage(`已导出到 ${uri.fsPath}`);
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 导出失败 — ${e.message}`);
+    }
+}
+
+async function doImportConfig(panel) {
+    const uri = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { JSON: ['json'] }, openLabel: '导入' });
+    if (!uri || !uri[0]) return;
+    let raw;
+    try {
+        raw = JSON.parse(fs.readFileSync(uri[0].fsPath, 'utf8'));
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 读取失败 — ${e.message}`);
+        return;
+    }
+    try {
+        const r = await importConfig(raw);
+        if (panel) panel.webview.postMessage({ type: 'init', state: readState() });
+        markRestart(panel);
+        // 逐项交代结果 —— 静默丢弃比报错更让人困惑
+        const notes = [];
+        if (r.missingImages.length) notes.push(`${r.missingImages.length} 张图在本机不存在,已跳过`);
+        if (r.rejected.length) notes.push(`${r.rejected.length} 项不合法已丢弃`);
+        if (r.failedKeys.length) notes.push(`${r.failedKeys.length} 个设置键写入失败`);
+        // 覆盖用户手写的 CSS 是最该说清的一件事,不能只报数字
+        if (r.customCssReplaced) notes.push(`你的自定义 CSS 已被替换,原文备份为 ${r.customCssReplaced}`);
+        vscode.window.showInformationMessage(
+            '配置已导入' + (notes.length ? `(${notes.join(';')})` : '') + '。重启后生效。');
+        if (r.rejected.length) console.warn('[美化控制台] 导入时丢弃:', r.rejected.join(', '));
+        if (r.missingImages.length) console.warn('[美化控制台] 缺失图片:', r.missingImages.join(', '));
+    } catch (e) {
+        vscode.window.showErrorMessage(`美化控制台: 导入失败 — ${e.message}`);
+    }
 }
 
 // 参数键 → VS Code 设置键 映射(原生即时生效类)
@@ -617,6 +1330,9 @@ async function promptRestart() {
 
 async function handleMessage(msg, panel) {
     try {
+        // 首次安装时自举正在逐条写默认值,插队写入会被它随后覆盖 ——
+        // 用户会先看到「已实时应用」,再看到值被改回去。
+        await bootstrapDone;
         if (msg.type === 'setFont') {
             // 选字体名 → 组装带平台兜底链的 fontFamily(编辑器+终端一起)
             const ff = fontStack(msg.value);
@@ -630,9 +1346,14 @@ async function handleMessage(msg, panel) {
             if (msg.key === 'paddingTop') warnFailed(await setConfig([['editor.padding.top', msg.value], ['editor.padding.bottom', msg.value]]));
             // 原生参数即时生效,无需重启
         } else if (msg.type === 'setAnim') {
-            // 动画写进 cus-dynamic.css(保持当前背景模式)
+            // 动画写进 cus-dynamic.css,背景模式必须原样保持。
+            // 这里曾把「非 codeOnly」一律折成 off,于是多区域模式下改一次动画档位
+            // 就把所有区域图层抹掉,而状态文件里还记着 regions —— 两边不一致。
+            const st = readBeautifyState();
             const bgm = readState().bgMode;
-            writeDynamicCss(msg.value, bgm === 'codeOnly' ? 'codeOnly' : 'off');
+            st.animMode = msg.value;
+            writeBeautifyState(st);
+            writeDynamicCss(msg.value, bgm, st);
             markRestart(panel);
         } else if (msg.type === 'setBg') {
             await applyBg(msg.value, true);
@@ -644,6 +1365,13 @@ async function handleMessage(msg, panel) {
                 // 仅代码区:写专属 codeOpacity,重写 dynamic css
                 warnFailed(await setConfig([['beautify.codeOpacity', msg.value]]));
                 writeDynamicCss(st.animMode, 'codeOnly');
+            } else if (st.bgMode === 'regions') {
+                // 多区域:全窗口的 background.opacity 在这个模式下无效,
+                // 这个总滑块改的是各区域的不透明度(区块里还能逐个微调)。
+                const bst = readBeautifyState();
+                for (const key of REGION_KEYS) bst.regions[key].opacity = msg.value;
+                applyRegionState(bst, panel);
+                return;
             } else {
                 // 全窗口:写 CUS 内建 background.opacity
                 warnFailed(await setConfig([['custom-ui-style.background.opacity', msg.value]]));
@@ -653,7 +1381,7 @@ async function handleMessage(msg, panel) {
             const uri = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { 图片: ['png', 'jpg', 'jpeg', 'webp'] } });
             if (uri && uri[0]) {
                 const p = uri[0].fsPath;
-                const dest = path.join(getUserDir(), 'backgrounds', path.basename(p));
+                const dest = path.join(getUserDir(), 'backgrounds', safeImageName(path.basename(p)));
                 fs.mkdirSync(path.dirname(dest), { recursive: true });
                 fs.copyFileSync(p, dest);
                 const url = toFileUrl(dest);
@@ -665,6 +1393,53 @@ async function handleMessage(msg, panel) {
                 panel.webview.postMessage({ type: 'init', state: readState() });
                 markRestart(panel);
             }
+        } else if (msg.type === 'regionAddImage') {
+            const uri = await vscode.window.showOpenDialog({
+                canSelectMany: true,
+                filters: { 图片: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'] }
+            });
+            if (uri && uri.length) {
+                const st = readBeautifyState();
+                const cfg = regionCfgOf(st, msg.region);
+                for (const u of uri) {
+                    const dest = copyIntoBackgrounds(u.fsPath);
+                    if (dest && !cfg.images.includes(dest)) cfg.images.push(dest);
+                }
+                st.bgMode = 'regions';
+                applyRegionState(st, panel);
+            }
+        } else if (msg.type === 'regionClear') {
+            const st = readBeautifyState();
+            regionCfgOf(st, msg.region).images = [];
+            applyRegionState(st, panel);
+        } else if (msg.type === 'regionOpacity') {
+            const st = readBeautifyState();
+            regionCfgOf(st, msg.region).opacity = msg.value;
+            applyRegionState(st, panel);
+        } else if (msg.type === 'regionInterval') {
+            const st = readBeautifyState();
+            regionCfgOf(st, msg.region).intervalMs = msg.value;
+            applyRegionState(st, panel);
+        } else if (msg.type === 'setBlend') {
+            const st = readBeautifyState();
+            for (const key of REGION_KEYS) st.regions[key].blend = !!msg.value;
+            applyRegionState(st, panel);
+        } else if (msg.type === 'setInlineImages') {
+            const st = readBeautifyState();
+            st.inlineImages = !!msg.value;
+            applyRegionState(st, panel);
+        } else if (msg.type === 'setCustomCssEnabled') {
+            warnFailed(await setConfig([['beautify.customCss.enabled', !!msg.value]]));
+            // 开关改的是 imports 里有没有这一条,所以要重登记
+            await syncCustomCssImport();
+            panel.webview.postMessage({ type: 'init', state: readState() });
+            markRestart(panel);
+        } else if (msg.type === 'openCustomCss') {
+            await openCustomCss();
+        } else if (msg.type === 'exportConfig') {
+            await doExportConfig();
+        } else if (msg.type === 'importConfig') {
+            await doImportConfig(panel);
         } else if (msg.type === 'setRadius') {
             if (setRadius(msg.value)) markRestart(panel);
         } else if (msg.type === 'reload' || msg.type === 'doRestart') {
@@ -712,6 +1487,9 @@ async function restoreDefaults(panel) {
     // 恢复默认 = 干净 JetBrains 外观:动画回 default 档,背景图关闭
     failed.push(...await setConfig([['custom-ui-style.background.url', '']]));
     failed.push(...await setConfig([['custom-ui-style.stylesheet', {}]]));  // 清空失效的旧设置残留
+    // 状态文件也要复位 —— 只写 CSS 的话,状态里仍记着 regions 和各区域图片列表,
+    // 与「已移除背景图」的提示不符,下次切回多区域旧图会自己冒出来。
+    writeBeautifyState(defaultState());
     writeDynamicCss('default', 'off');
     pendingRestart = false;
     await reloadCUS();
@@ -727,7 +1505,18 @@ module.exports = {
     defaultUserDir, resolveUserDir, getUserDir, cusBaseCss, cusDynamicCss,
     toFileUrl, fromFileUrl, isStaleManagedImport, MANAGED_CSS_NAMES,
     fontDirs, fallbackFonts, fontStack, listFonts, currentFontName,
-    setConfig, applicable, platformSkipKeys, warnFailed
+    setConfig, applicable, platformSkipKeys, warnFailed,
+    // 多区域背景 / 轮播
+    REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
+    imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss, safeImageName,
+    INLINE_IMAGE_MAX_BYTES, copyIntoBackgrounds, isAbsoluteAnyPlatform,
+    isCustomCssEnabled, panicDisableCustomCss, applyBg, readState, handleMessage, restoreDefaults,
+    // 状态
+    STATE_VERSION, stateFile, defaultState, sanitizeState, readBeautifyState, writeBeautifyState,
+    migrateLegacyState, ANIM_MODES, BG_MODES,
+    // 导出/导入
+    EXPORT_KIND, EXPORTED_SETTINGS, EXPORTED_SETTINGS_TYPES, settingTypeOk, exportConfig, importConfig,
+    getRadius, setRadius
 };
 
 function getHtml() {
@@ -947,11 +1736,35 @@ input[type=range]:active::-webkit-slider-thumb { transform: scale(1.25); }
     <div class="section">
         <h2>背景图 <span class="badge">需重载</span></h2>
         <div class="row"><label>模式<span class="q" tabindex="0" data-tip="背景图铺在哪:全窗口=整个界面都铺 / 仅代码区=只在编辑代码的区域 / 关闭=不要背景图。">?</span></label><div class="ctrl"><div class="seg" id="bgSeg">
-            <button data-v="full">全窗口</button><button data-v="codeOnly">仅代码区</button><button data-v="off">关闭</button>
+            <button data-v="full">全窗口</button><button data-v="codeOnly">仅代码区</button><button data-v="regions">多区域</button><button data-v="off">关闭</button>
         </div></div></div>
         <div class="row"><label>图片<span class="q" tabindex="0" data-tip="选一张图片当背景。选好后会自动复制到安全位置,不怕原图被移动或删除。">?</span></label><div class="ctrl"><button class="ghost" id="btnPick">选择图片…</button></div></div>
         <div class="row"><label>不透明度<span class="q" tabindex="0" data-tip="背景图的浓淡程度。数值越小图越淡、代码越清晰;越大图越明显。">?</span></label><div class="ctrl"><input type="range" id="bgOpacity" min="0.7" max="1" step="0.01"><span class="val" id="bgOpacityV"></span></div></div>
         <div class="hint">改背景会重载窗口</div>
+    </div>
+
+    <div class="section" id="secRegions">
+        <h2>多区域背景 <span class="badge">需重载</span></h2>
+        <div class="hint">编辑器 / 侧栏 / 面板可各设一张或多张图。多张图会按间隔淡入淡出轮播。</div>
+        <div id="regionRows"></div>
+        <div class="row"><label>混合模式<span class="q" tabindex="0" data-tip="开启后用 mix-blend-mode: screen 让图与底色融合,深色主题下更自然。浅色主题会发白,那就关掉。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="blendOn"><span class="slider-sw"></span></label></div></div>
+        <div class="row"><label>图片引用方式<span class="q" tabindex="0" data-tip="直接引用=CSS 里只写路径,文件小、加载快(推荐)。内嵌=把图片转成 base64 塞进 CSS,文件会大几十倍,只在直接引用不显示时才用。">?</span></label><div class="ctrl"><div class="seg" id="inlineSeg">
+            <button data-v="url">直接引用</button><button data-v="inline">内嵌 base64</button>
+        </div></div></div>
+    </div>
+
+    <div class="section">
+        <h2>自定义 CSS <span class="badge">需重载</span></h2>
+        <div class="row"><label>启用<span class="q" tabindex="0" data-tip="是否把你写的 CSS 注入界面。写坏了可以关掉,文件内容不会丢。">?</span></label><div class="ctrl"><label class="switch"><input type="checkbox" id="customCssOn"><span class="slider-sw"></span></label></div></div>
+        <div class="row"><label>编辑<span class="q" tabindex="0" data-tip="在编辑器里打开 cus-custom.css。本插件只创建它,永不覆盖你写的内容。">?</span></label><div class="ctrl"><button class="ghost" id="btnEditCss">打开 cus-custom.css</button></div></div>
+        <div class="hint" id="panicHint">⚠️ 自定义 CSS 能把整个界面弄不可见（连命令面板也会一起藏掉）。此时按 <b id="panicKey">Cmd+Alt+Shift+F12</b> 可一键关闭它恢复界面 —— 键绑定不依赖界面可见,所以在全黑时依然有效。</div>
+    </div>
+
+    <div class="section">
+        <h2>配置导入导出</h2>
+        <div class="row"><label>导出<span class="q" tabindex="0" data-tip="把整套美化配置存成一个 JSON 文件,可以分享或备份。图片按路径引用,不会把图片本身塞进去。">?</span></label><div class="ctrl"><button class="ghost" id="btnExport">导出配置…</button></div></div>
+        <div class="row"><label>导入<span class="q" tabindex="0" data-tip="读入一个导出过的 JSON。所有值都会先校验,非法项会被丢弃并告诉你。你现有的自定义 CSS 会先备份成 .bak。">?</span></label><div class="ctrl"><button class="ghost" id="btnImport">导入配置…</button></div></div>
+        <div class="hint">导入的图片路径若在本机不存在,会被跳过并列出来。</div>
     </div>
 
     <div class="section">
@@ -1035,15 +1848,72 @@ function render(){
     setSeg('bgSeg', S.bgMode || 'off');
     // 不透明度滑块:按模式切换范围(仅代码区 0.05~0.6 更淡,全窗口 0.7~1)
     const opEl = $('bgOpacity');
-    if (S.codeMode) { opEl.min = '0.05'; opEl.max = '0.6'; opEl.step = '0.01'; }
+    if (S.lowOpacityMode) { opEl.min = '0.03'; opEl.max = '0.8'; opEl.step = '0.01'; }
     else { opEl.min = '0.7'; opEl.max = '1'; opEl.step = '0.01'; }
-    const defOp = S.codeMode ? 0.22 : 0.92;
+    const defOp = S.lowOpacityMode ? 0.22 : 0.92;
     opEl.value = (typeof S.bgOpacity === 'number' ? S.bgOpacity : defOp);
     $('bgOpacityV').textContent = opEl.value;
     fillSelect($('colorTheme'), S.themes, S.colorTheme);
     fillSelect($('iconTheme'), S.iconThemes, S.iconTheme);
     fillSelect($('productIconTheme'), S.productThemes, S.productIconTheme);
     $('radius').value = S.radius || 8; $('radiusV').textContent = (S.radius || 8);
+    renderRegions();
+    // 多区域区块只在该模式下才有意义
+    $('secRegions').style.display = (S.bgMode === 'regions') ? '' : 'none';
+    setSeg('inlineSeg', S.inlineImages ? 'inline' : 'url');
+    // 任一区域开着就算开 —— 这个开关统一作用于所有区域
+    $('blendOn').checked = Object.values(S.regions || {}).some(r => r && r.blend !== false);
+    $('customCssOn').checked = S.customCssEnabled !== false;
+    $('panicKey').textContent = (S.platform === 'darwin' ? 'Cmd' : 'Ctrl') + '+Alt+Shift+F12';
+}
+
+// 每个区域一行:图片数量 / 添加 / 清空 / 不透明度 / 轮播间隔
+function renderRegions(){
+    const wrap = $('regionRows');
+    if (!wrap) return;
+    const regions = S.regions || {};
+    wrap.innerHTML = '';
+    (S.regionMeta || []).forEach(meta => {
+        const cfg = regions[meta.key] || { images: [], opacity: meta.defaultOpacity, intervalMs: 8000, blend: true };
+        const n = (cfg.images || []).length;
+        const row = document.createElement('div');
+        row.className = 'row';
+        const desc = n === 0 ? '未设置' : (n === 1 ? '1 张' : n + ' 张 · 轮播');
+        row.innerHTML =
+            '<label>' + meta.label + ' <span style="color:var(--muted);font-size:11px">' + desc + '</span></label>' +
+            '<div class="ctrl">' +
+            '<input type="range" min="0.03" max="0.8" step="0.01" data-op="' + meta.key + '" value="' + cfg.opacity + '">' +
+            '<span class="val" data-opv="' + meta.key + '">' + cfg.opacity + '</span>' +
+            '<button class="ghost" data-add="' + meta.key + '">添加图片…</button>' +
+            '<button class="ghost" data-clear="' + meta.key + '"' + (n ? '' : ' disabled') + '>清空</button>' +
+            '</div>';
+        wrap.appendChild(row);
+        // 两张图以上才显示间隔滑块 —— 单图没有轮播可言
+        if (n > 1) {
+            const ir = document.createElement('div');
+            ir.className = 'row';
+            const secs = Math.round((cfg.intervalMs || 8000) / 1000);
+            ir.innerHTML =
+                '<label style="padding-left:14px;color:var(--muted)">↳ 每张停留</label>' +
+                '<div class="ctrl"><input type="range" min="2" max="120" step="1" data-iv="' + meta.key + '" value="' + secs + '">' +
+                '<span class="val" data-ivv="' + meta.key + '">' + secs + 's</span></div>';
+            wrap.appendChild(ir);
+        }
+    });
+    wrap.querySelectorAll('[data-add]').forEach(b => b.addEventListener('click', () =>
+        post({ type: 'regionAddImage', region: b.dataset.add })));
+    wrap.querySelectorAll('[data-clear]').forEach(b => b.addEventListener('click', () =>
+        post({ type: 'regionClear', region: b.dataset.clear })));
+    wrap.querySelectorAll('[data-op]').forEach(el => {
+        const lbl = wrap.querySelector('[data-opv="' + el.dataset.op + '"]');
+        el.addEventListener('input', () => { lbl.textContent = el.value; });
+        el.addEventListener('change', () => post({ type: 'regionOpacity', region: el.dataset.op, value: parseFloat(el.value) }));
+    });
+    wrap.querySelectorAll('[data-iv]').forEach(el => {
+        const lbl = wrap.querySelector('[data-ivv="' + el.dataset.iv + '"]');
+        el.addEventListener('input', () => { lbl.textContent = el.value + 's'; });
+        el.addEventListener('change', () => post({ type: 'regionInterval', region: el.dataset.iv, value: parseInt(el.value, 10) * 1000 }));
+    });
 }
 // —— 原生即时生效类 ——
 function bindNative(id, key, ev){
@@ -1110,7 +1980,15 @@ $('btnPick').addEventListener('click', ()=> post({type:'pickImage'}));
 $('btnReload').addEventListener('click', ()=> post({type:'reload'}));
 $('btnRefresh').addEventListener('click', ()=> post({type:'refresh'}));
 $('btnRestore').addEventListener('click', ()=>{ vscode.postMessage({type:'restore'}); showToast('正在恢复默认…'); });
-$('btnDoRestart').addEventListener('click', ()=>{ vscode.postMessage({type:'doRestart'}); });</script>
+$('btnDoRestart').addEventListener('click', ()=>{ vscode.postMessage({type:'doRestart'}); });
+document.querySelectorAll('#inlineSeg button').forEach(b=>b.addEventListener('click',()=>{
+    setSeg('inlineSeg', b.dataset.v); post({type:'setInlineImages', value: b.dataset.v === 'inline'});
+}));
+$('blendOn').addEventListener('change', ()=> post({type:'setBlend', value: $('blendOn').checked}));
+$('customCssOn').addEventListener('change', ()=> post({type:'setCustomCssEnabled', value: $('customCssOn').checked}));
+$('btnEditCss').addEventListener('click', ()=> vscode.postMessage({type:'openCustomCss'}));
+$('btnExport').addEventListener('click', ()=>{ vscode.postMessage({type:'exportConfig'}); showToast('正在导出…'); });
+$('btnImport').addEventListener('click', ()=> vscode.postMessage({type:'importConfig'}));</script>
 </body>
 </html>`;
 }
