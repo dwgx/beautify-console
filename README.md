@@ -1,5 +1,11 @@
 # 🎨 美化控制台 Beautify Console
 
+[![CI](https://github.com/dwgx/beautify-console/actions/workflows/ci.yml/badge.svg)](https://github.com/dwgx/beautify-console/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/dwgx/beautify-console?label=release)](https://github.com/dwgx/beautify-console/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/dwgx/beautify-console/total?label=downloads)](https://github.com/dwgx/beautify-console/releases)
+[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.90.0-blue)](https://code.visualstudio.com/)
+[![License](https://img.shields.io/github/license/dwgx/beautify-console)](LICENSE)
+
 一个 VS Code 一站式可视化美化面板。字体、布局、编辑器、动画、多区域背景图、圆角、主题——全部在一个图形面板里点选调节，无需手写 JSON。
 
 > A visual, one-stop beautify panel for VS Code. Tune fonts, layout, editor, animations, multi-region background images, corner radius and themes — all from one GUI, no JSON editing.
@@ -147,9 +153,27 @@ Windows 为 `%LOCALAPPDATA%\Programs\Microsoft VS Code\resources\app\out\…` �
 
 ## 🧪 开发 Development
 
+没有构建步骤 —— `extension.js` 就是发布产物，改完存盘按 `F5` 即可调试。
+
 ```bash
-npm test    # 跨平台路径 / 字体 / CSS 生成 / 状态校验 用例（node --test，无第三方依赖）
+npm install   # 只装打包工具 @vscode/vsce，运行时零依赖
+npm test      # 跨平台路径 / 字体 / CSS 生成 / 状态校验 / 安全防护（node:test，63 个用例）
+npm run package   # 打出 .vsix
 ```
+
+样式分两条通道生效：字体布局类直接写 VS Code 设置（即时生效），动画背景圆角类生成 CSS 交由 Custom UI Style 注入（需完全重启）。生成的三个文件里 `cus-custom.css` 归你，扩展永不覆盖。
+
+架构说明、状态同步的坑、发布流程都在 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 🤝 参与 Contributing
+
+欢迎 issue 和 PR。
+
+- 报 Bug 或提功能建议 → [新建 issue](https://github.com/dwgx/beautify-console/issues/new/choose)
+- 想改代码 → 先看 [CONTRIBUTING.md](CONTRIBUTING.md) 里的项目结构和测试要求
+- 发现安全问题 → 见 [SECURITY.md](SECURITY.md)，请私下报告
+
+如果你导入过别人分享的配置文件，[SECURITY.md](SECURITY.md) 里说明了扩展做了哪些校验、以及哪些部分仍需你自己判断（尤其是配置里的 `customCss` 字段）。
 
 ## 🙏 致谢 Credits
 

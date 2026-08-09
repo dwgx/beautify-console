@@ -1,0 +1,39 @@
+name: 💡 功能建议
+description: 想加一个可调参数，或改进现有功能
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: 你想要什么
+      placeholder: 希望能单独调终端区域的背景图不透明度
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: 为什么需要
+      description: 你现在怎么绕过这个限制？说清使用场景比说清方案更有帮助
+      placeholder: 现在终端和面板共用一个不透明度，但终端文字更细，需要背景更淡才看得清
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 类型
+      options:
+        - 新的可调参数（面板里加一项）
+        - 改进现有参数（范围、默认值、交互）
+        - 新的背景/动画能力
+        - 其他
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        **一点说明**：本扩展的样式靠注入 CSS 实现，所以能做什么受 VS Code 的 DOM 结构限制。有些看起来简单的需求（比如改某个内置图标）可能没有稳定的选择器可用，或者会在 VS Code 升级后失效。如果你的建议属于这类，我会在 issue 里说明权衡。
+
+        如果你已经用 `cus-custom.css` 手写实现了这个效果，把那段 CSS 贴上来会大大加快进展。
