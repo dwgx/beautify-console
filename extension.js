@@ -13,6 +13,9 @@ const { pathToFileURL } = require('url');
 // 这样 Insiders、便携版、自定义 --user-data-dir 也都能对上。
 // ============================================================
 let userDir = null;
+// 面板 header 显示的扩展版本。activate 时从 context.extension.packageJSON 读取,
+// 测试/无 context 环境回落 'dev'。此前手维护的内部序号 v14 与发布版本脱节。
+let EXT_VERSION = 'dev';
 
 // 拿不到 context 时按平台兜底
 function defaultUserDir() {
@@ -84,19 +87,64 @@ function dataUriMime(p) {
     return DATA_URI_MIME[path.extname(String(p)).toLowerCase()] || 'png';
 }
 
+// 图片魔数嗅探:文件内容必须真的像图片才允许内嵌。
+// 导入的配置可以指向任何既有文件 —— 若只按扩展名判断,`~/.ssh/id_rsa`、
+// `/etc/hosts` 这类任意可读文件会被 dataUriMime 回落成 png 后 base64 内嵌进
+// CSS,明文送进渲染 DOM。魔数不匹配就丢弃,不给敏感文件出口。
+// 注意这一层挡的是「整类文件」,不是「文件里的每个字节」:PNG 魔数之后附加任意
+// 数据仍会放行(真实图片本就允许元数据尾块),要防的是把非图片文件当图片读。
+function imageMagicOk(buf) {
+    if (!buf || buf.length < 4) return false;
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return true; // PNG
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true;                    // JPEG
+    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return true; // GIF8
+    if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46)              // RIFF 容器
+        return buf.length >= 12 && buf.toString('latin1', 8, 12) === 'WEBP';                   // 必须真是 WebP
+    if (buf[0] === 0x42 && buf[1] === 0x4d) return true;                                       // BMP
+    return svgMagicOk(buf);
+}
+
+// SVG 是文本 XML,没有二进制魔数。判定必须锚定在开头:此前用「前 1KB 内出现
+// <svg」,于是任何含该字样的文本(笔记、日志、源码、带密钥的配置)都能通过,
+// 整个文件被 base64 内嵌进 CSS —— 正是这一层要挡的事。
+// 现在要求:跳过 BOM/空白后,只允许 XML 声明、注释、DOCTYPE 这些前置节点,
+// 且第一个真正的元素必须是 <svg。SVG 可含脚本,该风险由 workbench CSP 兜底。
+function svgMagicOk(buf) {
+    let s = buf.subarray(0, Math.min(buf.length, 4096)).toString('utf8');
+    if (s.charCodeAt(0) === 0xFEFF) s = s.slice(1);           // UTF-8 BOM
+    s = s.replace(/^\s+/, '');
+    // 逐个剥掉合法前置节点,每轮都必须真的消耗掉内容,否则退出防死循环
+    for (;;) {
+        const before = s;
+        if (/^<\?xml[\s?]/i.test(s)) s = s.replace(/^<\?xml[\s\S]*?\?>\s*/i, '');
+        else if (s.startsWith('<!--')) s = s.replace(/^<!--[\s\S]*?-->\s*/, '');
+        else if (/^<!DOCTYPE\s/i.test(s)) s = s.replace(/^<!DOCTYPE[^>]*>\s*/i, '');
+        else break;
+        if (s === before) break;
+    }
+    // 第一个元素必须是 svg(允许 <svg>、<svg 属性…>、命名空间前缀如 <svg:svg)
+    return /^<(?:[A-Za-z_][\w.-]*:)?svg[\s/>]/i.test(s);
+}
+
 // 把本地图片转成 base64 data URI —— 绕过 workbench CSP 对 file:/// 的拦截(关键修复)
+// 这是所有 base64 内嵌的唯一汇聚点(codeOnly 与多区域 inline 都经过),所以
+// 设备节点 / 非普通文件 / 非图片内容的防御必须落在这里,一条防线挡住所有读路径。
 function imageToDataUri(fileUrl) {
     try {
         if (!fileUrl || String(fileUrl).startsWith('data:')) return fileUrl;
         const p = fromFileUrl(fileUrl);
-        if (!fs.existsSync(p)) return fileUrl; // 找不到就退回原路径
-        // mime 只能取自白名单。扩展名来自文件名,直接拼进 data URI 的话,
-        // 形如 `a.x");}body{display:none}` 的文件就能闭合 CSS 字符串注入规则。
-        // 这一层独立于 safeImageName:导入的配置可以指向任何既有文件,
-        // 那些文件名从未经过清洗。
-        const b64 = fs.readFileSync(p).toString('base64');
-        return `data:image/${dataUriMime(p)};base64,${b64}`;
-    } catch (e) { return fileUrl; }
+        let st;
+        try { st = fs.statSync(p); } catch (e) { return fileUrl; }  // 找不到/无权限就退回原路径
+        // 设备节点(/dev/zero)、FIFO、目录、socket 一律不读 —— readFileSync 对
+        // 无限流设备会一直读下去,实测把扩展宿主拖到 OOM/挂死。
+        if (!st.isFile()) return '';
+        // 普通文件同样设上限:1GB 的任意文件一次 readFileSync 进内存也是 OOM。
+        if (st.size > INLINE_IMAGE_MAX_BYTES) return '';
+        const buf = fs.readFileSync(p);
+        // 内容必须真的像图片,否则任意可读文件都会被 base64 内嵌进 CSS。
+        if (!imageMagicOk(buf)) return '';
+        return `data:image/${dataUriMime(p)};base64,${buf.toString('base64')}`;
+    } catch (e) { return ''; }
 }
 
 // 动画三档预设(与之前设计一致)
@@ -161,7 +209,6 @@ function codeOnlyCss(bgUrl, opacity) {
             `content:'' !important; position:absolute !important; top:0; left:0; width:100%; height:100%; z-index:10 !important; pointer-events:none !important; background-image: url("${bgUrl}"); background-position: center center; background-repeat: no-repeat; background-size: cover; opacity: ${op};`
     };
 }
-const CODE_ONLY_KEYS = Object.keys(codeOnlyCss('x', 0.92));
 
 // ============================================================
 // 多区域背景 —— 区域定义表
@@ -257,6 +304,12 @@ function safeImageName(name) {
 const INLINE_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
 const skippedInlineImages = new Set();
 
+// 导入配置里 customCss 的大小上限。它原样写进 cus-custom.css 再被注入
+// workbench —— 不可信来源的 JSON 里放一个 100MB 字符串,导入一次就写一个
+// 100MB 的文件进 User 目录,每次开窗 CUS 都要解析。1MB 足够放下正常
+// 手写样式(实测导出自带 customCss 仅几百字节),超过即整段拒绝。
+const CUSTOM_CSS_MAX_BYTES = 1024 * 1024;
+
 // 把选中的图复制进 backgrounds/,返回目标绝对路径。
 // 目标名撞车时补序号:此前只按文件名落盘,选了 nature/bg.png 和 city/bg.png
 // 两张不同的图会写到同一个 bg.png,后者覆盖前者,列表里还只剩一条 ——
@@ -264,12 +317,22 @@ const skippedInlineImages = new Set();
 // 内容相同则复用,避免重复选同一张图时越堆越多。
 function copyIntoBackgrounds(srcPath) {
     try {
+        // 先验文件类型:设备节点(/dev/zero)、FIFO、目录的 readFileSync 要么无限
+        // 读要么读到脏内容。showOpenDialog 的扩展名 filter 只是软约束,用户能选
+        // 「所有文件」,导入配置也能指向任意路径,所以这里不能信调用方。
+        let st;
+        try { st = fs.statSync(srcPath); } catch (e) { throw new Error('文件不存在'); }
+        if (!st.isFile()) throw new Error('不是普通文件');
+        if (st.size > INLINE_IMAGE_MAX_BYTES) throw new Error(`超过 ${(INLINE_IMAGE_MAX_BYTES / 1048576).toFixed(0)}MB 上限`);
+        const src = fs.readFileSync(srcPath);
+        // 内容必须真的像图片 —— 否则把 .ssh/id_rsa 之类的任意文件复制进
+        // backgrounds/ 再被 region 引用,一样进渲染 DOM。
+        if (!imageMagicOk(src)) throw new Error('不是图片文件');
         const dir = path.join(getUserDir(), 'backgrounds');
         fs.mkdirSync(dir, { recursive: true });
         const name = safeImageName(path.basename(srcPath));
         const ext = path.extname(name);
         const stem = path.basename(name, ext);
-        const src = fs.readFileSync(srcPath);
         let dest = path.join(dir, name);
         for (let i = 2; ; i++) {
             if (!fs.existsSync(dest)) break;
@@ -285,23 +348,38 @@ function copyIntoBackgrounds(srcPath) {
     }
 }
 
+// 路径是否值得进渲染管线:普通文件 + 尺寸满足该路径的渲染方式。
+// 只做 stat 与扩展名判断,不读内容(内容校验在 imageToDataUri / copyIntoBackgrounds)。
+// 设备节点(/dev/zero)、FIFO、目录在这里就被排除 —— 它们就算存在,渲染阶段
+// 也读不了,提前归入「缺失/不可用」让导入流程向用户交代清楚。
+function pathIsInlinableImage(p) {
+    try {
+        const st = fs.statSync(p);
+        if (!st.isFile()) return false;
+        // 白名单内扩展名走 vscode-file 直接引用,不读入内存,大小无碍;
+        // 白名单外只能内联 base64,超过上限就渲染不了。
+        return canUseWorkbenchUrl(p) || st.size <= INLINE_IMAGE_MAX_BYTES;
+    } catch (e) { return false; }
+}
+
 // 单张图 → CSS url() 值。inline 为真时强制内联 base64(兜底开关)
 function imageCssUrl(absPath, inline) {
     if (!absPath) return '';
+    // stat 成功但非普通文件(设备节点/FIFO/目录):不生成任何 URL —— vscode-file
+    // 直接引用也一样,Custom UI Style 收到后照样去读设备节点。
+    let st = null;
+    try { st = fs.statSync(absPath); } catch (e) { /* 缺失/无权限,下面按原语义处理 */ }
+    if (st && !st.isFile()) return '';
     if (!inline && canUseWorkbenchUrl(absPath)) return toWorkbenchUrl(absPath);
     // 走内联路径但文件不在:imageToDataUri 会原样退回 file:// URL,而那正是
     // workbench CSP 拒绝加载的东西 —— CSS 里留下一条注定失败的规则。
     // 返回空串,让 regionCss 把这张图整个滤掉,失败得干脆一点。
-    if (!fs.existsSync(absPath)) return '';
-    // 内嵌路径先看体积
-    try {
-        const size = fs.statSync(absPath).size;
-        if (size > INLINE_IMAGE_MAX_BYTES) {
-            skippedInlineImages.add(absPath);
-            // 扩展名允许的话退回直接引用,总比不显示好
-            return canUseWorkbenchUrl(absPath) ? toWorkbenchUrl(absPath) : '';
-        }
-    } catch (e) { /* 读不到大小就照旧尝试 */ }
+    if (!st) return '';
+    if (st.size > INLINE_IMAGE_MAX_BYTES) {
+        skippedInlineImages.add(absPath);
+        // 扩展名允许的话退回直接引用,总比不显示好
+        return canUseWorkbenchUrl(absPath) ? toWorkbenchUrl(absPath) : '';
+    }
     return imageToDataUri(toFileUrl(absPath));
 }
 
@@ -439,28 +517,6 @@ function warnFailed(failed) {
     return failed;
 }
 
-// 合并 stylesheet: 应用动画档 + 代码区背景(互不干扰)
-function buildStylesheet(current, animMode, bgMode, bgUrl) {
-    let base = {};
-    // 从 current 里剔除所有由本插件管理的键(动画各档 + 代码区),保留用户手加的
-    const managed = new Set([
-        ...Object.keys(ANIM_PRESETS.default),
-        ...Object.keys(ANIM_PRESETS.smooth),
-        ...CODE_ONLY_KEYS
-    ]);
-    for (const k of Object.keys(current || {})) {
-        if (!managed.has(k)) base[k] = current[k];
-    }
-    // 叠加动画档
-    Object.assign(base, ANIM_PRESETS[animMode] || {});
-    // 叠加代码区背景
-    if (bgMode === 'codeOnly' && bgUrl) {
-        const op = vscode.workspace.getConfiguration().get('custom-ui-style.background.opacity');
-        Object.assign(base, codeOnlyCss(bgUrl, op));
-    }
-    return base;
-}
-
 // 改 cus-base.css 里的圆角基准变量(只改 --r 那一行,可反复修改不损坏)
 function setRadius(px) {
     try {
@@ -483,6 +539,53 @@ function getRadius() {
     } catch (e) { return 8; }
 }
 
+// 圆角/间距规则段 —— 恢复自 cus-base.css.template,运行时唯一真源。
+// 历史教训: 9b580ed 把 CUS_BASE_TEMPLATE 改成内联字符串时丢了这些规则,
+// 于是 --r 成了无人引用的死变量,滑块改了也没视觉效果。
+// 已装用户的 cus-base.css 只有 :root + keyframes,这里 append 补齐(不动用户调过的 --r 值)。
+const BASE_RADIUS_RULES =
+    '.title-label > h2 { font-weight: 600; }\n' +
+    '.monaco-workbench .part.editor > .content .editor-group-container > .title div.tabs-container > .tab { border-radius: var(--r) var(--r) 0 0; margin: 2px 1px 0 1px; }\n' +
+    '.quick-input-widget { border-radius: calc(var(--r) + 2px); overflow: hidden; }\n' +
+    '.monaco-list-row { border-radius: calc(var(--r) - 2px); }\n' +
+    '.monaco-workbench .monaco-list:not(.element-focused):focus:before { display: none; }\n' +
+    '.monaco-editor .rounded-highlight { border-radius: calc(var(--r) - 4px); }\n' +
+    '.suggest-widget { border-radius: calc(var(--r) + 2px); overflow: hidden; }\n' +
+    '.monaco-hover { border-radius: var(--r); }\n' +
+    '.editor-widget.find-widget { border-radius: 0 0 var(--r) var(--r); }\n' +
+    '.monaco-workbench .part > .composite.title-actions .action-item { border-radius: calc(var(--r) - 2px); }\n' +
+    '.monaco-button { border-radius: calc(var(--r) - 2px); }\n' +
+    '.monaco-inputbox { border-radius: calc(var(--r) - 2px); }\n' +
+    '.monaco-workbench .notifications-toasts .notification-toast { border-radius: calc(var(--r) + 2px); overflow: hidden; }\n' +
+    '.monaco-workbench .activitybar .action-item { border-radius: var(--r); }\n' +
+    '.monaco-workbench .activitybar .action-label { border-radius: var(--r); }\n' +
+    '.monaco-scrollable-element > .scrollbar > .slider { border-radius: calc(var(--r) - 2px); }\n' +
+    '.monaco-workbench .part.statusbar { font-size: 12px; }\n';
+
+// 确保 cus-base.css 存在且含圆角规则。幂等,可反复调用。
+// 检测条件: 「border-radius 引用了 var(--r)」——只认固定选择器会误判用户改写,
+// 只认 --r 变量会误判 9b580ed 产物(变量在但无消费规则)。
+function ensureBaseCss() {
+    const p = cusBaseCss();
+    const keyframes =
+        '@keyframes apc-fade-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }\n' +
+        '@keyframes apc-fade-scale { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }\n' +
+        '@keyframes apc-slide-in-left { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }\n' +
+        '@keyframes apc-bounce-in { 0% { opacity: 0; transform: scale(0.9) translateY(-8px); } 60% { opacity: 1; transform: scale(1.02) translateY(2px); } 100% { opacity: 1; transform: scale(1) translateY(0); } }\n' +
+        '@keyframes apc-zoom-in { from { opacity: 0; transform: scale(0.92); } to { opacity: 1; transform: scale(1); } }\n' +
+        '@keyframes apc-flip-in { from { opacity: 0; transform: perspective(400px) rotateX(-12deg); } to { opacity: 1; transform: perspective(400px) rotateX(0); } }\n';
+    if (!fs.existsSync(p)) {
+        fs.writeFileSync(p, ':root { --r: 8px; }\n' + BASE_RADIUS_RULES + keyframes);
+        return;
+    }
+    const css = fs.readFileSync(p, 'utf8');
+    if (!/border-radius:\s*(?:var|calc\(\s*var)\(--r\)/.test(css)) {
+        let out = css;
+        if (!/--r\s*:/.test(out)) out = ':root { --r: 8px; }\n' + out;  // 连变量都没有才补
+        fs.writeFileSync(p, out.trimEnd() + '\n' + BASE_RADIUS_RULES);
+    }
+}
+
 // ============================================================
 // 动态 CSS(动画 + 仅代码区背景)—— 写入 cus-dynamic.css,走 external.imports
 // 关键修复:此版本 Custom UI Style 不注入 stylesheet 设置,只注入 imports 的文件。
@@ -494,7 +597,7 @@ function cssFromObj(obj) {
     return Object.entries(obj).map(([sel, rule]) => `${sel} {\n    ${rule}\n}`).join('\n');
 }
 
-// 仅代码区专属透明度(独立于全窗口的 background.opacity;范围 0.05~0.6,默认 0.22)
+// 仅代码区专属透明度(独立于全窗口的 background.opacity;范围 0.05~0.8,默认 0.22)
 function getCodeOpacity() {
     const v = vscode.workspace.getConfiguration().get('beautify.codeOpacity');
     return (typeof v === 'number' && v >= 0.05 && v <= 0.8) ? v : 0.22;
@@ -511,7 +614,11 @@ function writeDynamicCss(animMode, bgMode, state) {
     // 仅代码区背景段(旧模式,保留:图转 base64 绕过 CSP;用专属的 codeOpacity)
     if (bgMode === 'codeOnly' && bgUrl) {
         const dataUri = imageToDataUri(bgUrl);
-        out += '/* ---- 仅代码区背景 ---- */\n' + cssFromObj(codeOnlyCss(dataUri, getCodeOpacity())) + '\n';
+        // 设备节点 / 非图片内容会被 imageToDataUri 拒掉返回空串 —— 此时别产出
+        // url("") 的废规则,整段跳过。
+        if (dataUri) {
+            out += '/* ---- 仅代码区背景 ---- */\n' + cssFromObj(codeOnlyCss(dataUri, getCodeOpacity())) + '\n';
+        }
     }
     // 多区域段:各区域独立图 / 不透明度 / 轮播
     if (bgMode === 'regions') {
@@ -634,8 +741,9 @@ function sanitizeState(raw) {
         }
         if (typeof src.opacity === 'number' && src.opacity >= 0 && src.opacity <= 1) dst.opacity = src.opacity;
         else if (src.opacity !== undefined) rejected.push(`${k}.opacity=${JSON.stringify(src.opacity)}`);
-        // 间隔下限 1s:再短会让 CSS 动画疯狂重绘
-        if (typeof src.intervalMs === 'number' && src.intervalMs >= 1000 && src.intervalMs <= 3600000) dst.intervalMs = src.intervalMs;
+        // 间隔下限 2s:与面板滑块最小档一致。更短会让 CSS 动画疯狂重绘,且滑块
+        // 表达不了 1s 档 —— 导入 1s 的配置会被滑块静默钳到 2s,显示与实际不符。
+        if (typeof src.intervalMs === 'number' && src.intervalMs >= 2000 && src.intervalMs <= 3600000) dst.intervalMs = src.intervalMs;
         else if (src.intervalMs !== undefined) rejected.push(`${k}.intervalMs=${JSON.stringify(src.intervalMs)}`);
         dst.blend = src.blend !== false;
     }
@@ -753,6 +861,9 @@ function exportConfig() {
         radius: getRadius(),
         settings,
         state: readBeautifyState(),
+        // 全窗口/仅代码区模式的单张选中图存在独立文件 .beautify-bg-image,
+        // 不进 state —— 不导出它,导入后这两种模式的背景图资产会永久丢失。
+        legacyImage: getChosenImage() || '',
         customCss
     };
 }
@@ -763,14 +874,24 @@ async function importConfig(raw) {
     if (raw.kind !== EXPORT_KIND) throw new Error(`不是美化控制台的配置文件(kind=${JSON.stringify(raw.kind)})`);
 
     const { state, rejected } = sanitizeState(raw.state);
-    // 缺图不阻断导入 —— 别人机器上的路径在本机大概率不存在,但其余配置仍有价值
+    // 缺图不阻断导入 —— 别人机器上的路径在本机大概率不存在,但其余配置仍有价值。
+    // 顺带把设备节点 / 目录 / 超大文件一并归入 missingImages:这些路径就算存在,
+    // 渲染阶段 imageToDataUri / vscode-file 也读不了,在这里就明说比到时候静默丢好。
     const missingImages = [];
     for (const k of REGION_KEYS) {
         state.regions[k].images = state.regions[k].images.filter(p => {
-            if (fs.existsSync(p)) return true;
+            if (pathIsInlinableImage(p)) return true;
             missingImages.push(p);
             return false;
         });
+    }
+
+    // 恢复单张选中图(全窗口/仅代码区模式的背景)。导出时它存成 legacyImage,
+    // 不恢复的话导入后这两种模式的背景图资产永久丢失。
+    if (typeof raw.legacyImage === 'string' && raw.legacyImage) {
+        const lp = fromFileUrl(raw.legacyImage);
+        if (pathIsInlinableImage(lp)) setChosenImage(toFileUrl(lp));
+        else missingImages.push(raw.legacyImage);
     }
 
     // 设置键:只认白名单内的键,值类型必须与当前值一致(或当前无值)
@@ -788,25 +909,33 @@ async function importConfig(raw) {
     }
     const failedKeys = await setConfig(updates);
 
-    if (typeof raw.radius === 'number' && raw.radius >= 0 && raw.radius <= 40) setRadius(Math.round(raw.radius));
+    // 上限与面板滑块一致(0~16):更大的圆角在标签/面板上是视觉灾难,滑块表达不了,
+    // 导入超过上限会让滑块静默截断、显示与实际不符。
+    if (typeof raw.radius === 'number' && raw.radius >= 0 && raw.radius <= 16) setRadius(Math.round(raw.radius));
     else if (raw.radius !== undefined) rejected.push(`radius=${JSON.stringify(raw.radius)}`);
 
     // 自定义 CSS 属于用户资产。备份必须带时间戳:固定的 .bak 会被下一次导入
     // 覆盖,连导两次原文就彻底没了(实测:第二次导入后 .bak 里是第一次导入的内容)。
+    // 大小上限 1MB:不可信来源的 JSON 里塞一个超大字符串,导入一次就写一个
+    // 超大文件进 User 目录,每次开窗 CUS 都要解析。超限整段拒绝并交代。
     let customCssReplaced = null;
     if (typeof raw.customCss === 'string') {
-        try {
-            let old = '';
-            try { old = fs.readFileSync(cusCustomCss(), 'utf8'); } catch (e) { /* 没有就当空 */ }
-            if (old !== raw.customCss) {
-                if (old.trim()) {
-                    const bak = uniqueBackupPath(cusCustomCss());
-                    fs.copyFileSync(cusCustomCss(), bak);
-                    customCssReplaced = path.basename(bak);
+        if (Buffer.byteLength(raw.customCss, 'utf8') > CUSTOM_CSS_MAX_BYTES) {
+            rejected.push(`自定义 CSS 超过 ${(CUSTOM_CSS_MAX_BYTES / 1048576).toFixed(0)}MB 上限,未导入`);
+        } else {
+            try {
+                let old = '';
+                try { old = fs.readFileSync(cusCustomCss(), 'utf8'); } catch (e) { /* 没有就当空 */ }
+                if (old !== raw.customCss) {
+                    if (old.trim()) {
+                        const bak = uniqueBackupPath(cusCustomCss());
+                        fs.copyFileSync(cusCustomCss(), bak);
+                        customCssReplaced = path.basename(bak);
+                    }
+                    fs.writeFileSync(cusCustomCss(), raw.customCss);
                 }
-                fs.writeFileSync(cusCustomCss(), raw.customCss);
-            }
-        } catch (e) { rejected.push(`自定义 CSS 写入失败: ${e.message}`); }
+            } catch (e) { rejected.push(`自定义 CSS 写入失败: ${e.message}`); }
+        }
     }
 
     writeBeautifyState(state);
@@ -976,7 +1105,7 @@ function readState() {
         animMode,
         bgMode,
         bgUrl,
-        // 按模式返回对应透明度:全窗口用 background.opacity(0.7~1),仅代码区用 codeOpacity(0.05~0.6)
+        // 按模式返回对应透明度:全窗口用 background.opacity(0.7~1),仅代码区用 codeOpacity(0.05~0.8)
         // 全窗口用 CUS 的 background.opacity(0.7~1);仅代码区与多区域是叠在
         // 内容上的图层,取值低得多(0.05~0.8),滑块范围必须跟着换。
         bgOpacity: bgMode === 'codeOnly' ? getCodeOpacity()
@@ -1024,15 +1153,10 @@ function isStaleManagedImport(entry, keep) {
 // 首次安装时自动应用 JetBrains 默认参数
 async function bootstrap() {
     try {
-        const baseTpl = ':root { --r: 8px; }\n' +
-            '@keyframes apc-fade-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }\n' +
-            '@keyframes apc-fade-scale { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }\n' +
-            '@keyframes apc-slide-in-left { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }\n' +
-            '@keyframes apc-bounce-in { 0% { opacity: 0; transform: scale(0.9) translateY(-8px); } 60% { opacity: 1; transform: scale(1.02) translateY(2px); } 100% { opacity: 1; transform: scale(1) translateY(0); } }\n' +
-            '@keyframes apc-zoom-in { from { opacity: 0; transform: scale(0.92); } to { opacity: 1; transform: scale(1); } }\n' +
-            '@keyframes apc-flip-in { from { opacity: 0; transform: perspective(400px) rotateX(-12deg); } to { opacity: 1; transform: perspective(400px) rotateX(0); } }\n';
         fs.mkdirSync(getUserDir(), { recursive: true });
-        if (!fs.existsSync(cusBaseCss())) fs.writeFileSync(cusBaseCss(), baseTpl);
+        // 创建或补齐 cus-base.css —— 幂等。已装用户缺圆角规则的文件也会被补齐,
+        // 而不是只在文件不存在时才创建(9b580ed 起圆角规则丢失,滑块改了 --r 无视觉效果)。
+        ensureBaseCss();
         if (!fs.existsSync(cusDynamicCss()) || fs.readFileSync(cusDynamicCss(), 'utf8').trim().length < 20) {
             writeDynamicCss('default', 'off');
         }
@@ -1112,6 +1236,8 @@ async function applyJetBrainsDefaults() {
 function activate(context) {
     let panel = null;
     resolveUserDir(context);   // 必须在 bootstrap 之前:所有文件路径都依赖它
+    // 面板 header 显示的真实版本号,取自 package.json(activate 时注入),不再手维护内部序号。
+    EXT_VERSION = (context.extension && context.extension.packageJSON && context.extension.packageJSON.version) || 'dev';
     // 不 await:activate 不该被 22 次设置写入拖住。但命令必须等它跑完再动手 ——
     // 首次安装时 applyJetBrainsDefaults 正在逐条写默认值,用户此刻拖字号会先被
     // 提示「已实时应用」,随后被默认值覆盖回去。
@@ -1120,7 +1246,10 @@ function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand('beautify.openPanel', () => {
         if (panel) { panel.dispose(); panel = null; } // 强制重建,保证最新 HTML
         panel = vscode.window.createWebviewPanel('beautifyPanel', '美化控制台', vscode.ViewColumn.Active,
-            { enableScripts: true, retainContextWhenHidden: true });
+            { enableScripts: true, retainContextWhenHidden: true,
+              // 收窄 vscode-resource: 可加载范围到扩展目录 + media/,防止面板被利用去读
+              // 任意本地文件(此前未设,默认整个磁盘都可经该协议访问)。
+              localResourceRoots: [context.extensionUri, vscode.Uri.joinPath(context.extensionUri, 'media')] });
         panel.webview.html = getHtml();
         panel.onDidDispose(() => { panel = null; }, null, context.subscriptions);
         panel.webview.postMessage({ type: 'init', state: readState() });
@@ -1198,13 +1327,23 @@ async function applyBg(mode, noReload) {
     // 用开头读到的旧值重写 CSS 会把那次改动抹掉(状态文件与 CSS 标记还会不一致)。
     const animMode = () => readDynamicModes().animMode;
     if (mode === 'full') {
-        // 全窗口:CUS 内建背景显示;dynamic css 只留动画(bg=off)
+        // 全窗口:CUS 内建背景显示;dynamic css 只留动画(bg=off)。
+        // 模式要落进状态文件,否则 CSS 标记(BG:off)与状态(记着上一模式)分叉,
+        // 导出的 state.bgMode 是陈旧的。
         warnFailed(await setConfig([['custom-ui-style.background.url', bgUrl]]));
-        writeDynamicCss(animMode(), 'off');
+        const st = readBeautifyState();
+        st.bgMode = 'full';
+        st.animMode = animMode();
+        writeBeautifyState(st);
+        writeDynamicCss(st.animMode, 'off');
     } else if (mode === 'codeOnly') {
-        // 仅代码区:清 url,把背景 CSS 写进 dynamic css
+        // 仅代码区:清 url,把背景 CSS 写进 dynamic css。同样同步状态文件。
         warnFailed(await setConfig([['custom-ui-style.background.url', '']]));
-        writeDynamicCss(animMode(), 'codeOnly');
+        const st = readBeautifyState();
+        st.bgMode = 'codeOnly';
+        st.animMode = animMode();
+        writeBeautifyState(st);
+        writeDynamicCss(st.animMode, 'codeOnly');
     } else if (mode === 'regions') {
         // 多区域:清 url,各区域 CSS 由状态文件驱动。模式要落进状态,
         // 否则下次读状态又回到 off,面板上的选择白点。
@@ -1349,6 +1488,11 @@ async function handleMessage(msg, panel) {
             // 动画写进 cus-dynamic.css,背景模式必须原样保持。
             // 这里曾把「非 codeOnly」一律折成 off,于是多区域模式下改一次动画档位
             // 就把所有区域图层抹掉,而状态文件里还记着 regions —— 两边不一致。
+            // 档位必须白名单校验:未知值会写进 ANIM:<evil> 标记,面板无法对应任何档位。
+            if (!ANIM_MODES.includes(msg.value)) {
+                vscode.window.showErrorMessage(`美化控制台: 无效的动画档位 ${JSON.stringify(msg.value)}`);
+                return;
+            }
             const st = readBeautifyState();
             const bgm = readState().bgMode;
             st.animMode = msg.value;
@@ -1362,9 +1506,11 @@ async function handleMessage(msg, panel) {
         } else if (msg.type === 'setBgOpacity') {
             const st = readState();
             if (st.bgMode === 'codeOnly') {
-                // 仅代码区:写专属 codeOpacity,重写 dynamic css
+                // 仅代码区:写专属 codeOpacity,重写 dynamic css。
+                // 动画档位必须 await 之后再读 —— 与 applyBg 同理,防止等待期间
+                // 用户改的动画档位被旧值重写抹掉(状态文件与 CSS 标记再次分叉)。
                 warnFailed(await setConfig([['beautify.codeOpacity', msg.value]]));
-                writeDynamicCss(st.animMode, 'codeOnly');
+                writeDynamicCss(readDynamicModes().animMode, 'codeOnly');
             } else if (st.bgMode === 'regions') {
                 // 多区域:全窗口的 background.opacity 在这个模式下无效,
                 // 这个总滑块改的是各区域的不透明度(区块里还能逐个微调)。
@@ -1380,10 +1526,10 @@ async function handleMessage(msg, panel) {
         } else if (msg.type === 'pickImage') {
             const uri = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { 图片: ['png', 'jpg', 'jpeg', 'webp'] } });
             if (uri && uri[0]) {
-                const p = uri[0].fsPath;
-                const dest = path.join(getUserDir(), 'backgrounds', safeImageName(path.basename(p)));
-                fs.mkdirSync(path.dirname(dest), { recursive: true });
-                fs.copyFileSync(p, dest);
+                // 走 copyIntoBackgrounds:内容相同复用 / 不同补序号防覆盖 / 类型与
+                // 魔数校验。此前直接 copyFileSync 会覆盖区域已引用的同名图。
+                const dest = copyIntoBackgrounds(uri[0].fsPath);
+                if (!dest) return;   // copyIntoBackgrounds 已弹错
                 const url = toFileUrl(dest);
                 // 只存图,不改模式:保存到独立文件,再按【当前模式】重新应用
                 setChosenImage(url);
@@ -1413,10 +1559,24 @@ async function handleMessage(msg, panel) {
             regionCfgOf(st, msg.region).images = [];
             applyRegionState(st, panel);
         } else if (msg.type === 'regionOpacity') {
+            // 值必须是有穷数字且落在 CSS 合法区间 [0,1]。NaN/Infinity 会经
+            // JSON.stringify 写进状态文件为 null、CSS 产出 opacity: NaN !important,
+            // 整条规则失效。sanitizeState 只在导入/读盘时挡,面板消息要自校验。
+            if (typeof msg.value !== 'number' || !Number.isFinite(msg.value)) {
+                vscode.window.showErrorMessage('美化控制台: 无效的不透明度值');
+                return;
+            }
             const st = readBeautifyState();
-            regionCfgOf(st, msg.region).opacity = msg.value;
+            regionCfgOf(st, msg.region).opacity = Math.min(1, Math.max(0, msg.value));
             applyRegionState(st, panel);
         } else if (msg.type === 'regionInterval') {
+            // 间隔必须是有穷数字且落在 [2s, 1h](与 sanitizeState 下限一致)。
+            // 同样防 NaN 进 CSS 动画时长。
+            if (typeof msg.value !== 'number' || !Number.isFinite(msg.value) ||
+                msg.value < 2000 || msg.value > 3600000) {
+                vscode.window.showErrorMessage('美化控制台: 无效的轮播间隔');
+                return;
+            }
             const st = readBeautifyState();
             regionCfgOf(st, msg.region).intervalMs = msg.value;
             applyRegionState(st, panel);
@@ -1450,6 +1610,9 @@ async function handleMessage(msg, panel) {
             panel.webview.postMessage({ type: 'init', state: readState() });
         } else if (msg.type === 'refresh') {
             panel.webview.postMessage({ type: 'init', state: readState() });
+        } else {
+            // 未知消息类型不静默吞:开发期能发现前端/后端协议漂移。
+            console.warn(`[美化控制台] 未处理的消息类型: ${JSON.stringify(msg.type)}`);
         }
     } catch (e) {
         vscode.window.showErrorMessage('美化控制台: ' + e.message);
@@ -1509,14 +1672,16 @@ module.exports = {
     // 多区域背景 / 轮播
     REGIONS, REGION_KEYS, VSCODE_FILE_EXTS, toWorkbenchUrl, canUseWorkbenchUrl,
     imageCssUrl, carouselKeyframes, regionCss, writeDynamicCss, cusCustomCss, safeImageName,
-    INLINE_IMAGE_MAX_BYTES, copyIntoBackgrounds, isAbsoluteAnyPlatform,
+    INLINE_IMAGE_MAX_BYTES, CUSTOM_CSS_MAX_BYTES, copyIntoBackgrounds, isAbsoluteAnyPlatform,
+    imageMagicOk, svgMagicOk, pathIsInlinableImage, imageToDataUri,
     isCustomCssEnabled, panicDisableCustomCss, applyBg, readState, handleMessage, restoreDefaults,
+    getChosenImage, setChosenImage,
     // 状态
     STATE_VERSION, stateFile, defaultState, sanitizeState, readBeautifyState, writeBeautifyState,
     migrateLegacyState, ANIM_MODES, BG_MODES,
     // 导出/导入
     EXPORT_KIND, EXPORTED_SETTINGS, EXPORTED_SETTINGS_TYPES, settingTypeOk, exportConfig, importConfig,
-    getRadius, setRadius
+    getRadius, setRadius, ensureBaseCss
 };
 
 function getHtml() {
@@ -1525,7 +1690,7 @@ function getHtml() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: https: file: vscode-resource:; script-src 'unsafe-inline';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: vscode-resource:; script-src 'unsafe-inline';">
 <style>
 :root {
     --bg: #1e1f22; --panel: #2b2d30; --fg: #bcbec4; --muted: #8a8e96;
@@ -1683,7 +1848,7 @@ input[type=range]:active::-webkit-slider-thumb { transform: scale(1.25); }
 </head>
 <body>
 <div class="header">
-    <h1>🎨 美化控制台 <span style="font-size:11px;color:var(--muted);font-weight:400">v14</span></h1>
+    <h1>🎨 美化控制台 <span style="font-size:11px;color:var(--muted);font-weight:400">v${EXT_VERSION}</span></h1>
     <div class="actions">
         <button class="ghost" id="btnRestore">恢复默认</button>
         <button class="ghost" id="btnRefresh">刷新</button>
@@ -1846,9 +2011,9 @@ function render(){
     $('paddingTop').value = S.paddingTop || 10; $('paddingTopV').textContent = (S.paddingTop||10);
     setSeg('animSeg', S.animMode || 'off');
     setSeg('bgSeg', S.bgMode || 'off');
-    // 不透明度滑块:按模式切换范围(仅代码区 0.05~0.6 更淡,全窗口 0.7~1)
+    // 不透明度滑块:按模式切换范围(仅代码区 0.05~0.8 更淡,全窗口 0.7~1)
     const opEl = $('bgOpacity');
-    if (S.lowOpacityMode) { opEl.min = '0.03'; opEl.max = '0.8'; opEl.step = '0.01'; }
+    if (S.lowOpacityMode) { opEl.min = '0.05'; opEl.max = '0.8'; opEl.step = '0.01'; }
     else { opEl.min = '0.7'; opEl.max = '1'; opEl.step = '0.01'; }
     const defOp = S.lowOpacityMode ? 0.22 : 0.92;
     opEl.value = (typeof S.bgOpacity === 'number' ? S.bgOpacity : defOp);
@@ -1882,7 +2047,7 @@ function renderRegions(){
         row.innerHTML =
             '<label>' + meta.label + ' <span style="color:var(--muted);font-size:11px">' + desc + '</span></label>' +
             '<div class="ctrl">' +
-            '<input type="range" min="0.03" max="0.8" step="0.01" data-op="' + meta.key + '" value="' + cfg.opacity + '">' +
+            '<input type="range" min="0.05" max="0.8" step="0.01" data-op="' + meta.key + '" value="' + cfg.opacity + '">' +
             '<span class="val" data-opv="' + meta.key + '">' + cfg.opacity + '</span>' +
             '<button class="ghost" data-add="' + meta.key + '">添加图片…</button>' +
             '<button class="ghost" data-clear="' + meta.key + '"' + (n ? '' : ' disabled') + '>清空</button>' +

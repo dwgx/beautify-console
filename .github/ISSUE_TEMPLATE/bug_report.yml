@@ -1,0 +1,81 @@
+name: 🐛 Bug 报告
+description: 功能不工作、样式没生效、报错
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先确认一件事：**样式改动需要完全重启 VS Code 才生效**（macOS 是 `Command + Q`，不是关窗口；Windows 要结束所有 `Code.exe`）。`Reload Window` 不会刷新样式缓存。
+
+        这个原因占了相当一部分「没生效」的问题。
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 问题是什么
+      description: 你期望发生什么，实际发生了什么
+      placeholder: 拖动圆角滑块后点了应用并重载，界面圆角没有任何变化
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开美化控制台
+        2. 把圆角滑块拖到 12
+        3. 点「应用并重载」，VS Code 重启
+        4. 标签页边角仍然是直角
+    validations:
+      required: true
+
+  - type: input
+    id: ext-version
+    attributes:
+      label: 扩展版本
+      description: 面板标题栏显示的版本号，或 `code --list-extensions --show-versions | grep beautify`
+      placeholder: 1.2.0
+    validations:
+      required: true
+
+  - type: input
+    id: vscode-version
+    attributes:
+      label: VS Code 版本
+      description: 运行 `code --version` 的第一行
+      placeholder: 1.132.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - macOS
+        - Windows
+        - Linux
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: restart
+    attributes:
+      label: 确认项
+      options:
+        - label: 我做了**完全重启**（不是 Reload Window）
+        - label: Custom UI Style 已安装且启用
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他信息
+      description: |
+        如果是样式问题，贴一下生成的 CSS 会很有帮助。文件在 VS Code 的 User 目录下：
+        - macOS `~/Library/Application Support/Code/User/`
+        - Windows `%APPDATA%\Code\User\`
+        - Linux `~/.config/Code/User/`
+
+        相关文件：`cus-base.css`（圆角）、`cus-dynamic.css`（动画和背景）。
+        如果有报错弹窗或输出面板的日志，也一并贴上。

@@ -2,7 +2,7 @@
     "name": "beautify-console",
     "displayName": "美化控制台 Beautify Console",
     "description": "VS Code 一站式可视化美化面板:字体/布局/编辑器/动画/多区域背景图/圆角/主题,支持轮播、自定义 CSS、配置导入导出。A visual beautify panel for VS Code.",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "publisher": "dwgx",
     "license": "MIT",
     "engines": {
@@ -35,7 +35,11 @@
     ],
     "main": "./extension.js",
     "scripts": {
-        "test": "node --test \"test/*.test.js\""
+        "test": "node --test \"test/*.test.js\"",
+        "package": "vsce package --out beautify-console-$npm_package_version.vsix"
+    },
+    "devDependencies": {
+        "@vscode/vsce": "^3.9.2"
     },
     "contributes": {
         "commands": [

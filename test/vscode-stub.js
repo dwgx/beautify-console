@@ -16,6 +16,10 @@ const Uri = {
             catch (e) { fsPath = decodeURIComponent(s.replace(/^file:\/*/, '/')); }
         }
         return { fsPath, scheme: 'file', toString: () => s };
+    },
+    joinPath(base, ...parts) {
+        const fsPath = require('node:path').join(base.fsPath, ...parts);
+        return { fsPath, scheme: base.scheme || 'file', toString: () => pathToFileURL(fsPath).toString() };
     }
 };
 

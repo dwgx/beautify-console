@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 安全问题
+    url: https://github.com/dwgx/beautify-console/security/advisories/new
+    about: 涉及安全的问题请私下报告，不要开公开 issue
+  - name: 🆘 界面被改坏了进不去
+    url: https://github.com/dwgx/beautify-console#-恢复手段-recovery
+    about: 先看恢复手段，最快是 Cmd/Ctrl + Alt + Shift + F12 一键关闭自定义 CSS
+  - name: 🎨 样式注入相关问题
+    url: https://github.com/subframe7536/vscode-custom-ui-style/issues
+    about: 「安装似乎已损坏」黄条、注入失效等属于依赖的 Custom UI Style

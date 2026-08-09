@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.2.0] - 2026-08-09
+
+### 安全
+- **导入配置可触发 OOM/挂死**：图片路径可指向 `/dev/zero` 等设备节点，`readFileSync` 无限读取拖垮扩展宿主。现在所有读文件路径先 `statSync` 校验 `isFile()`，设备/FIFO/目录/超大文件一律拒绝
+- **任意可读文件会被 base64 内嵌进 CSS**：导入配置的图片路径指向 `~/.ssh/id_rsa`、`/etc/hosts` 等文件时，非白名单扩展名会经 `dataUriMime` 回落成 png 后整文件 base64 进渲染 DOM。新增魔数嗅探，文件内容必须真的像图片（PNG/JPEG/GIF/WebP/BMP 魔数或含 `<svg`）
+- **customCss 导入无大小上限**：不可信来源的 JSON 可塞入超大字符串，一次写超大文件进 User 目录。上限 1MB，超限整段拒绝并交代
+- **SVG 判定可被任意文本绕过**：魔数嗅探对 SVG 用「前 1KB 含 `<svg`」，于是含该字样的笔记、日志、源码、带密钥的配置都能通过，整个文件 base64 进 CSS。判定改为锚定文件开头（跳过 BOM/空白，只允许 XML 声明、注释、DOCTYPE 前置，首个元素必须是 `<svg`）
+- **webview 收窄**：`localResourceRoots` 限定面板可加载范围；CSP 的 `img-src` 去掉 `https:`/`file:`（面板无外部图片依赖）
+- **面板消息值校验**：`setAnim` 档位、`regionOpacity`/`regionInterval` 数值补白名单与范围校验，防止 NaN/未知值写进状态与 CSS
+
+### 修复
+- **圆角滑块失效**：`--r` 变量定义了但无任何消费者（9b580ed 把模板改内联字符串时丢了 17 条圆角规则）。`ensureBaseCss()` 幂等补齐已装用户的 `cus-base.css`，保留用户调过的圆角值
+- **全窗口/仅代码区背景切换后状态分叉**：`applyBg` 的 full/codeOnly 分支只写 CSS 标记不写状态文件，导出的 `state.bgMode` 陈旧。现在三处（CSS 标记/状态/面板）同步
+- **`pickImage` 覆盖区域同名图**：直接 `copyFileSync` 会覆盖 `backgrounds/` 里区域已引用的同名图，改为复用 `copyIntoBackgrounds`（内容比对复用/补序号/类型校验）
+- **导出丢图**：full/codeOnly 模式的单张选中图只在 `.beautify-bg-image`，不进导出 JSON。`exportConfig` 新增 `legacyImage`，导入时恢复
+- **`setBgOpacity` 竞态**：codeOnly 分支 await 前捕获动画档位，等待期间用户改档位会被旧值覆盖。改 await 后读取
+- **导入半径静默截断**：导入校验上限 40 而滑块 0~16，导入 17~40 的值会被滑块钳制。校验收紧到 16
+- **轮播间隔下限不一致**：`sanitizeState` 允许 1s 而滑块最小 2s，导入 1s 会被静默钳到 2s。统一到 2s
+- **面板 header 版本号脱节**：硬编码 `v14` 改为从 `package.json` 读取真实版本
+
+### 变更
+- 删除死代码 `buildStylesheet`/`CODE_ONLY_KEYS`（旧 stylesheet 注入方案残留）
+- 删除孤儿文件 `cus-base.css.template` 出包（vsix 不再包含）
+
 ## [1.1.0] - 2026-08-05
 
 ### 安全
@@ -58,6 +82,11 @@
 ### 变更
 - macOS 上隐藏「菜单栏」一项——菜单由系统顶栏接管，`window.menuBarVisibility` 无效
 - 字体候选新增 SF Mono / Menlo / Monaco / Liberation Mono / Noto Sans Mono
+
+## [1.0.3] - 2026-07-12
+
+### 新增
+- 首次安装时自动应用 JetBrains 默认参数（编辑器字体、状态栏、动画、主题等）
 
 ## [1.0.2] - 2026-07-12
 
