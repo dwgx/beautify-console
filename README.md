@@ -22,7 +22,7 @@
 
 ## 📦 依赖 Dependency
 
-本扩展通过 [Custom UI Style](https://marketplace.visualstudio.com/items?itemName=subframe7536.custom-ui-style) 注入样式，安装时会自动提示安装它。
+本扩展通过 [Custom UI Style](https://marketplace.visualstudio.com/items?itemName=subframe7536.custom-ui-style) 注入样式，安装时会自动提示安装它。本扩展还依赖两个 JetBrains 主题扩展（Int UI Dark 深色主题与 int-ui-icons-dark 图标主题），安装时会自动安装。
 
 ## 🚀 安装 Install
 
@@ -54,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
   sudo chown -R $(whoami) "/Applications/Visual Studio Code.app"
   ```
 - 「菜单栏」一项在 macOS 上不显示——菜单由系统顶栏接管，`window.menuBarVisibility` 无效
-- 若你在 Windows 上用过本扩展并开了 Settings Sync：同步过来的 `custom-ui-style.external.imports` 里会残留 Windows 路径（`file://C:/Users/...`），这些条目在 macOS 上解析不到文件。**v1.0.4 起会在激活时自动清理**，你自己手加的 import 不受影响
+- 若你在 Windows 上用过本扩展并开了 Settings Sync：同步过来的 `custom-ui-style.external.imports` 里会残留 Windows 路径（`file://C:/Users/...`），这些条目在 macOS 上解析不到文件。**v1.0.5 起会在激活时自动清理**，你自己手加的 import 不受影响
 
 ## 🖱 使用 Usage
 
@@ -74,7 +74,8 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 - **图片引用方式**默认「直接引用」：CSS 里只写路径，体积极小。若图片不显示，切到「内嵌 base64」——
   能用但 CSS 会大几十倍（12 张 2MB 的图内嵌约 33MB，直接引用约 1KB）。
   内嵌模式下超过 2MB 的单图会自动退回直接引用并提示 —— 否则光三个区域各 4 张就能产出 112MB CSS，
-  而这个文件每次开窗都要被解析
+  而这个文件每次开窗都要被解析。扩展名必须在白名单内（.png/.jpg/.jpeg/.webp/.gif/.bmp/.svg），
+  否则即使小于 2MB 也无法内嵌，会直接跳过该图
 - 同名不同图不会互相覆盖（自动补序号），重复选同一张图会复用而不堆积
 
 轮播是纯 CSS 实现，不依赖后台定时器。系统开启「减少动效」时会停在第一张不闪。
@@ -132,6 +133,7 @@ VS Code**，不是刷新窗口 —— 先存好手头的文件。
 ```bash
 # macOS
 : > "$HOME/Library/Application Support/Code/User/cus-custom.css"
+# 两个目录名都试:不同 VS Code 版本 workbench 落在 electron-browser 或 electron-sandbox
 for d in electron-browser electron-sandbox; do
     f="/Applications/Visual Studio Code.app/Contents/Resources/app/out/vs/code/$d/workbench/external.css"
     [ -f "$f" ] && : > "$f"
@@ -139,9 +141,9 @@ done
 # 然后 Command+Q 完全退出再打开
 ```
 
-Linux 同理，路径为 `/usr/share/code/resources/app/out/…` 与 `~/.config/Code/User/`；
+Linux 同理，路径为 `/usr/share/code/resources/app/out/vs/code/<electron-browser|electron-sandbox>/workbench/external.css` 与 `~/.config/Code/User/`；
 Windows 为 `%LOCALAPPDATA%\Programs\Microsoft VS Code\resources\app\out\…` 与 `%APPDATA%\Code\User\`。
-（macOS 路径已实机核对，另两个平台按同样结构推得。）
+（macOS 路径已实机核对，另两个平台按同样结构推得。两个目录名都清一遍是兜底 —— 界面全黑时不该再赌版本。）
 
 ## 🧪 开发 Development
 

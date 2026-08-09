@@ -33,8 +33,14 @@ find_code_cli() {
 
 CODE_CLI="$(find_code_cli || true)"
 
-# 3. 复制本项目到扩展目录(版本号取自 package.json,与 vsix 安装保持一致)
-VERSION="$(node -p "require('$SRC/package.json').version" 2>/dev/null || echo "1.1.0")"
+# 3. 复制本项目到扩展目录。版本号取自 package.json(与 install.ps1 一致):
+#    不依赖 node —— macOS 上 node 常不在 PATH,静默回退硬编码版本会让目录名与
+#    package.json 不符,同 ID 多份会被 VS Code 视为冲突
+VERSION="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SRC/package.json" | head -n 1)"
+if [ -z "$VERSION" ]; then
+    echo "错误: 无法从 $SRC/package.json 解析版本号,安装中止" >&2
+    exit 1
+fi
 TARGET="$EXT_ROOT/dwgx.beautify-console-$VERSION"
 echo "复制到: $TARGET"
 # 清掉本扩展的旧版本目录 —— 同 ID 多份会被 VS Code 视为冲突

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # 有 package-lock.json,用 ci 保证可复现;lock 与 package.json 不一致时会直接失败
+      - run: npm ci
+      - run: npm test
+
+  package:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # 仓库默认 workflow 权限是 read,而建 release / 传附件需要写 contents。
+    # 在这里声明比改仓库全局设置更精确,且跟着代码走。
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # tag 必须与 package.json 的 version 一致 —— 否则会发出版本号与包内不符的
+      # vsix(VS Code 装的是包内版本,用户下载的文件名却是 tag 名)。宁可失败也不错发。
+      - name: Verify tag matches package.json version
+        run: |
+          PKG_VERSION="$(node -p 'require("./package.json").version')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "package.json=$PKG_VERSION  tag=$TAG_VERSION"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME 与 package.json 版本 $PKG_VERSION 不一致,拒绝发布"
+            exit 1
+          fi
+          echo "VSIX_NAME=beautify-console-$PKG_VERSION.vsix" >> "$GITHUB_ENV"
+      - name: Package .vsix
+        run: npx --yes @vscode/vsce package --out "$VSIX_NAME"
+      - name: Upload release asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # release 可能已存在(手动建过或重跑):先试 create,已存在则 upload --clobber
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "./$VSIX_NAME" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "./$VSIX_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "美化控制台 $GITHUB_REF_NAME" \
+              --generate-notes
+          fi

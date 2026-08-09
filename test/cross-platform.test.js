@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
 const os = require('node:os');
+const fs = require('node:fs');
 const Module = require('node:module');
 
 // 把 require('vscode') 重定向到桩,必须在 require extension.js 之前装好
@@ -15,6 +16,52 @@ Module._resolveFilename = function (request, ...rest) {
 };
 
 const ext = require('../extension.js');
+
+// 最小合法图片(带正确魔数)。魔数嗅探之后,内嵌 / 复制测试必须用真实图片内容,
+// 否则会被当成「任意可读文件」拒绝 —— 那正是新防御要挡的东西。
+const zlib = require('node:zlib');
+// 按扩展名生成带对应魔数的最小内容(仅够通过 imageMagicOk 嗅探)
+function magicBytesFor(ext) {
+    switch (ext) {
+        case '.png': return minimalPng();
+        case '.jpg': case '.jpeg': return Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+        case '.gif': return Buffer.from('GIF89a' + '\x01\x00' + '\x01\x00' + '\x00\x00\x00' + '\x00' + '\x00' + ';');
+        case '.webp': return Buffer.from([0x52, 0x49, 0x46, 0x46, 0x1c, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]);
+        case '.bmp': return Buffer.from('BM' + '\x00\x00\x00\x00\x00\x00\x00\x00');
+        case '.svg': return Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>');
+        default: return minimalPng();
+    }
+}
+function minimalPng(pixel = 0xff0000ff) {
+    // 1x1 透明 PNG;pixel 为 RGBA 小端整数值,换值可产出内容不同的合法 PNG
+    const crcTable = [];
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        crcTable[n] = c >>> 0;
+    }
+    const crc32 = buf => {
+        let c = 0xFFFFFFFF;
+        for (const b of buf) c = crcTable[(c ^ b) & 0xFF] ^ (c >>> 8);
+        return (c ^ 0xFFFFFFFF) >>> 0;
+    };
+    const chunk = (type, data) => {
+        const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+        const t = Buffer.from(type, 'latin1');
+        const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(Buffer.concat([t, data])));
+        return Buffer.concat([len, t, data, crc]);
+    };
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(1, 0); ihdr.writeUInt32BE(1, 4);  // 1x1
+    ihdr[8] = 8; ihdr[9] = 6;                            // 8-bit, RGBA
+    const px = Buffer.alloc(5); px[0] = 0;               // filter 0
+    px.writeUInt32BE(pixel >>> 0, 1);
+    const idat = zlib.deflateSync(px);
+    return Buffer.concat([
+        Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+        chunk('IHDR', ihdr), chunk('IDAT', idat), chunk('IEND', Buffer.alloc(0))
+    ]);
+}
 
 // 临时切换 process.platform 跑断言
 function onPlatform(name, fn) {
@@ -582,15 +629,18 @@ test('同名不同图不得互相覆盖(复制一份的承诺不能被自己破�
         fs.mkdirSync(path.join(tmp, 'city'));
         const a = path.join(tmp, 'nature', 'bg.png');
         const b = path.join(tmp, 'city', 'bg.png');
-        fs.writeFileSync(a, 'AAAA-nature');
-        fs.writeFileSync(b, 'BBBB-city');
+        // 必须是真实 PNG —— 魔数嗅探后任意文本内容会被当作非图片拒绝
+        const pngA = minimalPng(0xff0000ff);  // 红色
+        const pngB = minimalPng(0x0000ffff);  // 蓝色
+        fs.writeFileSync(a, pngA);
+        fs.writeFileSync(b, pngB);
 
         // 此前只按文件名落盘,两张不同的图写到同一个 bg.png,后者覆盖前者
         const d1 = ext.copyIntoBackgrounds(a);
         const d2 = ext.copyIntoBackgrounds(b);
         assert.notStrictEqual(d1, d2, '同名不同图必须各自落盘');
-        assert.strictEqual(fs.readFileSync(d1, 'utf8'), 'AAAA-nature', '先前那张不能被覆盖');
-        assert.strictEqual(fs.readFileSync(d2, 'utf8'), 'BBBB-city');
+        assert.strictEqual(fs.readFileSync(d1).toString('base64'), pngA.toString('base64'), '先前那张不能被覆盖');
+        assert.strictEqual(fs.readFileSync(d2).toString('base64'), pngB.toString('base64'));
 
         // 重选同一张图应复用,不该无限堆积
         assert.strictEqual(ext.copyIntoBackgrounds(a), d1, '内容相同应复用');
@@ -789,9 +839,10 @@ test('图片扩展名不得注入 CSS(两层都要挡住)', () => {
         assert.ok(!safe.includes('"'), `清洗后仍含双引号: ${safe}`);
         assert.strictEqual(safe, 'wallpaper.png', '白名单外的扩展名应回落 .png');
 
-        // 第二层:直接把恶意文件名落到磁盘,绕过清洗(导入的配置可指向任何既有文件)
+        // 第二层:直接把恶意文件名落到磁盘,绕过清洗(导入的配置可指向任何既有文件)。
+        // 内容必须是合法 PNG —— 魔数嗅探会拒绝文本内容,这里测的是文件名注入。
         const p = path.join(tmp, evil);
-        fs.writeFileSync(p, 'x');
+        fs.writeFileSync(p, minimalPng());
         const url = ext.imageCssUrl(p, false);
         assert.ok(!url.includes('"'), `data URI 仍含双引号: ${url.slice(0, 60)}`);
         assert.match(url, /^data:image\/png;base64,/, 'mime 应回落白名单内的 png');
@@ -802,11 +853,11 @@ test('图片扩展名不得注入 CSS(两层都要挡住)', () => {
         const withoutUrl = line.replace(/url\("[^"]*"\)/, 'URL').replace(/ !important;$/, '');
         assert.ok(!/[{};]/.test(withoutUrl), `规则被提前闭合: ${line.slice(0, 100)}`);
 
-        // 各白名单扩展名的 mime 映射正确
+        // 各白名单扩展名的 mime 映射正确(内容必须带对应魔数才能内嵌)
         for (const [name, want] of [['a.jpg', 'jpeg'], ['a.jpeg', 'jpeg'], ['a.png', 'png'],
                                     ['a.webp', 'webp'], ['a.svg', 'svg+xml'], ['a.gif', 'gif']]) {
             const q = path.join(tmp, name);
-            fs.writeFileSync(q, 'x');
+            fs.writeFileSync(q, magicBytesFor(path.extname(name)));
             assert.match(ext.imageCssUrl(q, true), new RegExp(`^data:image/${want.replace('+', '\\+')};`), name);
         }
     } finally {
@@ -840,8 +891,11 @@ test('内嵌模式对超限图片设上限(否则 CSS 会涨到上百 MB)', () =
         const limit = ext.INLINE_IMAGE_MAX_BYTES;
         const small = path.join(tmp, 'small.png');
         const big = path.join(tmp, 'big.png');
-        fs.writeFileSync(small, Buffer.alloc(1024, 1));
-        fs.writeFileSync(big, Buffer.alloc(limit + 1024, 1));
+        // 内容必须是合法 PNG(否则魔数嗅探会在大小判断之前先拒绝)
+        const smallBuf = Buffer.concat([minimalPng(), Buffer.alloc(1024, 1)]);
+        const bigBuf = Buffer.concat([minimalPng(), Buffer.alloc(limit + 1024, 1)]);
+        fs.writeFileSync(small, smallBuf);
+        fs.writeFileSync(big, bigBuf);
 
         // 小图照常内嵌
         assert.ok(ext.imageCssUrl(small, true).startsWith('data:'), '小图应内嵌');
@@ -870,8 +924,9 @@ test('imageCssUrl 白名单外的扩展名退回 base64 内联', () => {
         // workbench CSP 会拒绝加载的东西,等于给静默失效发了通行证。
         const png = path.join(tmp, 'a.png');
         const tiff = path.join(tmp, 'a.tiff');
-        fs.writeFileSync(png, 'x');
-        fs.writeFileSync(tiff, 'x');
+        // 内容必须是合法 PNG —— 魔数嗅探会拒绝文本内容
+        fs.writeFileSync(png, minimalPng());
+        fs.writeFileSync(tiff, minimalPng());
 
         assert.match(ext.imageCssUrl(png), /^vscode-file:\/\/vscode-app\//);
         // .tiff 不在 Electron 的 validExtensions 里,只能内联
@@ -897,7 +952,9 @@ test('激活后在解析出的 User 目录下自举,并清理跨平台残留 imp
         const userDir = path.join(tmp, 'User');
         const ctx = {
             subscriptions: [],
-            globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'dwgx.beautify-console') }
+            globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'dwgx.beautify-console') },
+            // localResourceRoots 需要 extensionUri
+            extensionUri: vscodeStub.Uri.file(path.join(tmp, 'ext'))
         };
         // 预置:两条从 Windows 同步过来的失效条目 + 一条用户自己加的
         const mine = 'file:///Users/me/my-own.css';
@@ -943,5 +1000,513 @@ test('激活后在解析出的 User 目录下自举,并清理跨平台残留 imp
         assert.ok(Array.isArray(init.state.fonts) && init.state.fonts.length > 0);
     } finally {
         fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+// ============================================================
+// 导入安全:设备节点 / 非图片内容 / customCss 超限
+// ============================================================
+
+test('imageToDataUri 拒绝设备节点(/dev/zero)—— readFileSync 会无限读,OOM/挂死', () => {
+    // 存在但非普通文件:必须返回空串,绝不能落到 readFileSync
+    if (!fs.existsSync('/dev/zero')) {
+        console.warn('本机无 /dev/zero,跳过设备节点用例');
+        return;
+    }
+    assert.strictEqual(ext.imageToDataUri(ext.toFileUrl('/dev/zero')), '',
+        '/dev/zero 必须被 isFile 拦截,不能读');
+});
+
+test('imageCssUrl 拒绝设备节点(哪怕能走 vscode-file 直接引用)', () => {
+    if (!fs.existsSync('/dev/zero')) {
+        console.warn('本机无 /dev/zero,跳过设备节点用例');
+        return;
+    }
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beautify-devurl-'));
+    try {
+        // 真实存在的「设备节点」在文件系统里没有扩展名;用符号链接让它看起来像
+        // 一张 .png —— statSync 跟随链接,isFile 为 false,必须拒绝
+        const lnk = path.join(tmp, 'zero.png');
+        fs.symlinkSync('/dev/zero', lnk);
+        assert.strictEqual(ext.imageCssUrl(lnk), '', '设备节点不得产出任何 URL');
+        assert.strictEqual(ext.imageCssUrl(lnk, true), '', 'inline 路径同样拦截');
+        // 裸设备路径(无扩展名)走内联,同样拦截
+        assert.strictEqual(ext.imageCssUrl('/dev/zero', true), '');
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('importConfig 把设备节点归入 missingImages 而不是写进状态', async () => {
+    if (!fs.existsSync('/dev/zero')) {
+        console.warn('本机无 /dev/zero,跳过设备节点用例');
+        return;
+    }
+    const fs2 = require('node:fs');
+    const tmp = fs2.mkdtempSync(path.join(os.tmpdir(), 'beautify-dev-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs2.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        const r = await ext.importConfig({
+            kind: 'beautify-console-config', version: 1, settings: {},
+            state: { bgMode: 'regions', regions: { editor: { images: ['/dev/zero', '/dev/zero.png'] } } }
+        });
+        assert.deepStrictEqual(r.missingImages, ['/dev/zero', '/dev/zero.png'],
+            '设备节点应在导入时被挑出并明说');
+        const st = ext.readBeautifyState();
+        assert.deepStrictEqual(st.regions.editor.images, [], '设备节点不得进入渲染状态');
+    } finally {
+        fs2.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('敏感文件不被 base64 内嵌进 CSS(魔数嗅探)', () => {
+    const vscodeStub = require('./vscode-stub.js');
+    const fs2 = require('node:fs');
+    const tmp = fs2.mkdtempSync(path.join(os.tmpdir(), 'beautify-magic-'));
+    try {
+        // 模拟 ~/.ssh/id_rsa 与 /etc/hosts:可读、扩展名不在白名单、内容是文本
+        const key = path.join(tmp, 'id_rsa');
+        const hosts = path.join(tmp, 'hosts.txt');
+        fs2.writeFileSync(key, '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA...');
+        fs2.writeFileSync(hosts, '127.0.0.1 localhost\n255.255.255.255 broadcasthost\n');
+
+        // 走内联:魔数不匹配 → 空串,明文不进 data URI
+        assert.strictEqual(ext.imageToDataUri(ext.toFileUrl(key)), '', '私钥不得内嵌');
+        assert.strictEqual(ext.imageToDataUri(ext.toFileUrl(hosts)), '', 'hosts 不得内嵌');
+
+        // 整体 CSS:regionCss 把非法图滤掉,data:image 一个都不该出现
+        const css = ext.regionCss('editor', { images: [key, hosts], opacity: 0.22, intervalMs: 8000, inline: true });
+        assert.ok(!/data:image/.test(css), '敏感文件内容不得进渲染 CSS');
+        assert.ok(!css.includes('b3BlbnNzaC1rZXktdjE'), '私钥内容泄漏进 CSS');
+
+        // 魔数不匹配的文件也不该被 copyIntoBackgrounds 复制进 backgrounds/
+        vscodeStub.window.errors.length = 0;
+        assert.strictEqual(ext.copyIntoBackgrounds(key), null, '非图片文件不得复制进 backgrounds/');
+        assert.ok(vscodeStub.window.errors.some(e => /不是图片文件/.test(e)), '应明说不是图片');
+        vscodeStub.window.errors.length = 0;
+
+        // 扩展名伪装成 .png 也骗不过魔数:内容仍是文本
+        const fakePng = path.join(tmp, 'fake.png');
+        fs2.writeFileSync(fakePng, '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA');
+        assert.strictEqual(ext.imageToDataUri(ext.toFileUrl(fakePng)), '', '伪装的 .png 也要按内容拒绝');
+    } finally {
+        fs2.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('importConfig 拒绝超大 customCss(恶意配置塞满磁盘)', async () => {
+    const fs2 = require('node:fs');
+    const tmp = fs2.mkdtempSync(path.join(os.tmpdir(), 'beautify-csscap-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs2.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        fs2.writeFileSync(path.join(userDir, 'cus-base.css'), ':root { --r: 8px; }\n');
+        const mine = '/* 我的 CSS */\n';
+        fs2.writeFileSync(ext.cusCustomCss(), mine);
+
+        const overLimit = 'x'.repeat(ext.CUSTOM_CSS_MAX_BYTES + 1);
+        const r = await ext.importConfig({
+            kind: 'beautify-console-config', version: 1, settings: {}, state: {},
+            customCss: overLimit
+        });
+        assert.ok(r.rejected.some(x => /自定义 CSS.*上限/.test(x)), '超限必须进入被拒项');
+        assert.strictEqual(fs2.readFileSync(ext.cusCustomCss(), 'utf8'), mine, '超限配置不得覆盖现有 CSS');
+        assert.strictEqual(r.customCssReplaced, null, '超限时不该产生备份');
+
+        // 临界值:恰好在上限内应正常导入
+        const r2 = await ext.importConfig({
+            kind: 'beautify-console-config', version: 1, settings: {}, state: {},
+            customCss: 'x'.repeat(ext.CUSTOM_CSS_MAX_BYTES)
+        });
+        assert.ok(!r2.rejected.some(x => /自定义 CSS.*上限/.test(x)), '恰好在上限内不该被拒');
+    } finally {
+        fs2.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('FIFO / 符号链接指向设备也读不了(旁侧防御)', () => {
+    const fs2 = require('node:fs');
+    const tmp = fs2.mkdtempSync(path.join(os.tmpdir(), 'beautify-fifo-'));
+    const hasMkfifo = process.platform !== 'win32';
+    try {
+        // 符号链接指向 /dev/zero:statSync 跟随链接,isFile 应为 false → 拒绝
+        if (fs2.existsSync('/dev/zero')) {
+            const lnk = path.join(tmp, 'zero-link.png');
+            fs2.symlinkSync('/dev/zero', lnk);
+            assert.strictEqual(ext.imageCssUrl(lnk, true), '',
+                '指向设备节点的符号链接不得内嵌');
+        }
+        // 真 FIFO:showOpenDialog 之外的入口(导入配置)可以指向它
+        if (hasMkfifo) {
+            try {
+                require('node:child_process').execFileSync('mkfifo', [path.join(tmp, 'pipe.png')]);
+                assert.strictEqual(ext.imageCssUrl(path.join(tmp, 'pipe.png'), true), '',
+                    'FIFO 不得内嵌(readFileSync 会永久阻塞)');
+            } catch (e) { console.warn('mkfifo 不可用,跳过 FIFO 用例:', e.message); }
+        }
+        // 目录同样拒绝
+        const dir = path.join(tmp, 'adir.png');
+        fs2.mkdirSync(dir);
+        assert.strictEqual(ext.imageCssUrl(dir, true), '', '目录不得当图片内嵌');
+    } finally {
+        fs2.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('imageToDataUri 对超大普通文件也设上限,不一次读进内存', () => {
+    const fs2 = require('node:fs');
+    const tmp = fs2.mkdtempSync(path.join(os.tmpdir(), 'beautify-huge-'));
+    try {
+        // 只写一个稀疏文件头(带 PNG 魔数),size 超过上限 —— statSync 报 size
+        // 大,但不真正分配磁盘,读前就被 size 检查拦下。
+        const huge = path.join(tmp, 'huge.png');
+        const fd = fs2.openSync(huge, 'w');
+        fs2.writeSync(fd, minimalPng());
+        fs2.fsyncSync(fd);
+        fs2.closeSync(fd);
+        fs2.truncateSync(huge, ext.INLINE_IMAGE_MAX_BYTES + 1);
+        assert.ok(fs2.statSync(huge).size > ext.INLINE_IMAGE_MAX_BYTES, '前置:确实超限');
+        assert.strictEqual(ext.imageToDataUri(ext.toFileUrl(huge)), '',
+            '超大文件不得 readFileSync 进内存');
+    } finally {
+        fs2.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+
+// —— 1.2.0 修复:圆角规则恢复 ——
+test('ensureBaseCss 生成的文件含圆角规则(滑块改 --r 才有视觉效果)', () => {
+    const fs3 = require('node:fs');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-radius-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs3.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        ext.ensureBaseCss();
+        const css = fs3.readFileSync(path.join(userDir, 'cus-base.css'), 'utf8');
+        // 变量 + 圆角规则 + keyframes 都在
+        assert.match(css, /--r:\s*8px/);
+        assert.match(css, /\.monaco-hover \{ border-radius: var\(--r\); \}/);
+        assert.match(css, /border-radius: calc\(var\(--r\)/);
+        assert.match(css, /@keyframes apc-fade-in/);
+    } finally {
+        fs3.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('ensureBaseCss 给已装用户的旧文件补齐圆角规则且保留 --r 值', () => {
+    const fs3 = require('node:fs');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-radius-mig-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs3.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        // 9b580ed 产物:只有变量 + keyframes,无圆角规则(圆角失效的根因形态)
+        fs3.writeFileSync(path.join(userDir, 'cus-base.css'),
+            ':root { --r: 14px; }\n@keyframes apc-fade-in { from { opacity: 0; } to { opacity: 1; } }\n');
+        ext.ensureBaseCss();
+        const css = fs3.readFileSync(path.join(userDir, 'cus-base.css'), 'utf8');
+        // 用户调过的 14px 不能被重置回 8
+        assert.match(css, /--r:\s*14px/);
+        // 圆角规则补齐了
+        assert.match(css, /\.monaco-hover \{ border-radius: var\(--r\); \}/);
+        assert.match(css, /border-radius: calc\(var\(--r\)/);
+    } finally {
+        fs3.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('ensureBaseCss 幂等:反复调用不重复追加规则', () => {
+    const fs3 = require('node:fs');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-radius-idem-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs3.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        fs3.writeFileSync(path.join(userDir, 'cus-base.css'), ':root { --r: 8px; }\n');
+        ext.ensureBaseCss();
+        const once = fs3.readFileSync(path.join(userDir, 'cus-base.css'), 'utf8');
+        ext.ensureBaseCss();
+        ext.ensureBaseCss();
+        const twice = fs3.readFileSync(path.join(userDir, 'cus-base.css'), 'utf8');
+        assert.strictEqual(twice, once, '重复调用不该重复追加');
+        // 直接 var(--r) 的三条:.monaco-hover / activitybar 两条。核心是幂等对比,次数是佐证。
+        assert.ok((once.match(/border-radius: var\(--r\)/g) || []).length >= 3, '圆角规则应存在');
+    } finally {
+        fs3.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('setRadius 在 ensureBaseCss 补齐后的文件上仍工作', () => {
+    const fs3 = require('node:fs');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-radius-set-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs3.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        ext.ensureBaseCss();
+        assert.strictEqual(ext.setRadius(12), true);
+        assert.strictEqual(ext.getRadius(), 12);
+        const css = fs3.readFileSync(path.join(userDir, 'cus-base.css'), 'utf8');
+        assert.match(css, /--r:\s*12px/, '变量被更新');
+        assert.match(css, /\.monaco-hover \{ border-radius: var\(--r\); \}/, '规则里的 var(--r) 原样保留');
+    } finally {
+        fs3.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+// —— 1.2.0 修复:导入半径上限与滑块一致(0~16) ——
+test('importConfig 拒绝 radius>16(与滑块上限一致,防静默截断)', async () => {
+    const fs3 = require('node:fs');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-radius-imp-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs3.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        ext.ensureBaseCss();
+        ext.setRadius(8);
+        const r = await ext.importConfig({
+            kind: 'beautify-console-config', version: 1, settings: {},
+            state: {}, radius: 30
+        });
+        assert.ok(r.rejected.some(x => x.includes('radius')), `30 应被拒: ${r.rejected.join(';')}`);
+        assert.strictEqual(ext.getRadius(), 8, '文件 --r 不该被改成 30');
+        // 合法半径仍放行
+        const r2 = await ext.importConfig({
+            kind: 'beautify-console-config', version: 1, settings: {},
+            state: {}, radius: 14
+        });
+        assert.deepStrictEqual(r2.rejected, []);
+        assert.strictEqual(ext.getRadius(), 14);
+    } finally {
+        fs3.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+// —— 1.2.0 修复:面板 header 显示真实版本号 ——
+test('activate 后 getHtml 用真实版本号替换内部序号', async () => {
+    const fs3 = require('node:fs');
+    const vscodeStub3 = require('./vscode-stub.js');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-ver-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs3.mkdirSync(userDir, { recursive: true });
+        const ctx = {
+            subscriptions: [],
+            globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') },
+            extensionUri: vscodeStub3.Uri.file(path.join(tmp, 'ext')),
+            extension: { packageJSON: { version: '9.9.9' } }
+        };
+        ext.activate(ctx);
+        // activate 只注册命令,需调用 openPanel 才创建面板
+        await vscodeStub3.__commands.get('beautify.openPanel')();
+        const panels = vscodeStub3.window.panels;
+        const html = panels[panels.length - 1].webview.html;
+        assert.match(html, /v9\.9\.9/, '应显示 package.json 真实版本');
+        assert.ok(!/v14/.test(html), '内部序号 v14 不应再出现');
+    } finally {
+        fs3.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+// —— 1.2.0 修复:全窗口/仅代码区模式的状态同步 ——
+test('applyBg(full/codeOnly) 后状态文件与 CSS 标记一致', async () => {
+    const fs3 = require('node:fs');
+    const vscodeStub3 = require('./vscode-stub.js');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-bgsync-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs3.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        const img = path.join(tmp, 'bg.png');
+        fs3.writeFileSync(img, magicBytesFor('.png'));
+        ext.setChosenImage(ext.toFileUrl(img));
+        const st = ext.defaultState();
+        st.bgMode = 'regions';
+        st.regions.editor.images = [img];
+        ext.writeBeautifyState(st);
+
+        await ext.applyBg('codeOnly', true);
+        assert.strictEqual(ext.readBeautifyState().bgMode, 'codeOnly', '状态文件要同步');
+        assert.strictEqual(ext.readState().bgMode, 'codeOnly', 'CSS 标记与状态一致');
+        assert.match(fs3.readFileSync(path.join(userDir, 'cus-dynamic.css'), 'utf8'), /BG:codeOnly/);
+
+        await ext.applyBg('full', true);
+        assert.strictEqual(ext.readBeautifyState().bgMode, 'full', '状态文件要同步');
+        assert.strictEqual(ext.readState().bgMode, 'full', 'CSS 标记与状态一致');
+    } finally {
+        vscodeStub3.__store.delete('custom-ui-style.background.url');
+        fs3.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+// —— 1.2.0 修复:pickImage 不覆盖区域同名图 ——
+test('pickImage 复用 copyIntoBackgrounds,同名不同图不互相覆盖', async () => {
+    const fs3 = require('node:fs');
+    const vscodeStub3 = require('./vscode-stub.js');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-pick-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs3.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        // 区域已引用 backgrounds/bg.png(内容 A)
+        const a = path.join(tmp, 'a.png');
+        fs3.writeFileSync(a, magicBytesFor('.png'));
+        const destA = ext.copyIntoBackgrounds(a);
+        const st = ext.defaultState();
+        st.bgMode = 'regions';
+        st.regions.editor.images = [destA];
+        ext.writeBeautifyState(st);
+        const contentA = fs3.readFileSync(destA, 'utf8');
+
+        // pickImage 选另一张同名 bg.png(内容 B) —— 不同内容必须另起序号,不覆盖 A
+        const b = path.join(tmp, 'bg.png');
+        const bufB = magicBytesFor('.png');
+        bufB[0] = 0x89; // 仍是 PNG 魔数,但改个字节让内容不同
+        fs3.writeFileSync(b, bufB);
+        vscodeStub3.__store.set('custom-ui-style.background.url', '');
+        vscodeStub3.window.panels.length = 0;
+        vscodeStub3.window.showOpenDialog = async () => [{ fsPath: b }];
+        try {
+            const panel = { webview: { postMessage() {} } };
+            await ext.handleMessage({ type: 'pickImage' }, panel);
+            const dir = path.join(userDir, 'backgrounds');
+            const files = fs3.readdirSync(dir);
+            assert.ok(files.length >= 2, `应产生新副本,实际 ${files.join(',')}`);
+            assert.strictEqual(fs3.readFileSync(destA, 'utf8'), contentA, '原区域图不能被覆盖');
+        } finally {
+            vscodeStub3.window.showOpenDialog = async () => undefined;
+        }
+    } finally {
+        fs3.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+// —— 1.2.0 修复:导出包含 legacyImage,导入恢复单张选中图 ——
+test('full/codeOnly 模式导出→导入往返保留单张选中图', async () => {
+    const fs3 = require('node:fs');
+    const vscodeStub3 = require('./vscode-stub.js');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-legacy-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs3.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        ext.ensureBaseCss();
+        const img = path.join(tmp, 'bg.png');
+        fs3.writeFileSync(img, magicBytesFor('.png'));
+        ext.setChosenImage(ext.toFileUrl(img));
+        const st = ext.defaultState();
+        st.bgMode = 'codeOnly';
+        ext.writeBeautifyState(st);
+
+        const exported = ext.exportConfig();
+        assert.ok(exported.legacyImage, '导出应含 legacyImage');
+        // 清空现状后导入
+        ext.setChosenImage('');
+        const r = await ext.importConfig(exported);
+        assert.deepStrictEqual(r.rejected, []);
+        assert.strictEqual(ext.getChosenImage(), ext.toFileUrl(img), '导入后单图恢复');
+    } finally {
+        vscodeStub3.__store.delete('beautify.codeOpacity');
+        fs3.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+// —— 1.2.0 修复:面板消息值校验 ——
+test('setAnim 非法档位不污染状态/CSS 标记', async () => {
+    const fs3 = require('node:fs');
+    const vscodeStub3 = require('./vscode-stub.js');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-animchk-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs3.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        ext.writeBeautifyState(ext.defaultState());
+        vscodeStub3.window.errors.length = 0;
+        const panel = { webview: { postMessage() {} } };
+        await ext.handleMessage({ type: 'setAnim', value: 'evil' }, panel);
+        assert.ok(vscodeStub3.window.errors.length >= 1, '非法档位必须报错');
+        assert.strictEqual(ext.readBeautifyState().animMode, 'default', '状态不该被污染');
+        // 非法档位被拒后不应触发 CSS 写入 —— 不存在该文件正好证明没被污染
+        assert.ok(!fs3.existsSync(path.join(userDir, 'cus-dynamic.css')), '非法档位不应写 CSS');
+    } finally {
+        vscodeStub3.window.errors.length = 0;
+        fs3.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('regionOpacity NaN 不写进 CSS/状态', async () => {
+    const fs3 = require('node:fs');
+    const vscodeStub3 = require('./vscode-stub.js');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-nan-'));
+    try {
+        const userDir = path.join(tmp, 'User');
+        fs3.mkdirSync(userDir, { recursive: true });
+        ext.resolveUserDir({ globalStorageUri: { fsPath: path.join(userDir, 'globalStorage', 'x.y') } });
+        const st = ext.defaultState();
+        st.regions.editor.opacity = 0.2;
+        ext.writeBeautifyState(st);
+        vscodeStub3.window.errors.length = 0;
+        const panel = { webview: { postMessage() {} } };
+        await ext.handleMessage({ type: 'regionOpacity', region: 'editor', value: NaN }, panel);
+        assert.ok(vscodeStub3.window.errors.length >= 1, 'NaN 必须报错');
+        // 非法值被拒后不触发 applyRegionState 的 CSS 写入 —— 文件不存在正好证明没被污染
+        assert.ok(!fs3.existsSync(path.join(userDir, 'cus-dynamic.css')), '非法值不应写 CSS');
+        assert.strictEqual(ext.readBeautifyState().regions.editor.opacity, 0.2, '状态值不能变');
+    } finally {
+        vscodeStub3.window.errors.length = 0;
+        fs3.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+// —— 1.2.0 安全:SVG 判定必须锚定开头,否则任意含 <svg 字样的文本都能内嵌进 CSS ——
+test('svgMagicOk 只认真正以 svg 开头的文件(含合法前置节点)', () => {
+    const ok = [
+        ['纯 svg', '<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>'],
+        ['XML 声明', '<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="x"></svg>'],
+        ['注释前置', '<!-- generated by Inkscape -->\n<svg width="1"></svg>'],
+        ['DOCTYPE 前置', '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/svg11.dtd">\n<svg></svg>'],
+        ['三种前置齐全', '<?xml version="1.0"?>\n<!--c-->\n<!DOCTYPE svg>\n<svg/>'],
+        ['UTF-8 BOM', '﻿<svg></svg>'],
+        ['前置空白', '\n\n   <svg></svg>'],
+        ['命名空间前缀', '<svg:svg xmlns:svg="x"></svg:svg>'],
+        ['自闭合', '<svg/>']
+    ];
+    for (const [name, content] of ok) {
+        assert.strictEqual(ext.svgMagicOk(Buffer.from(content, 'utf8')), true, `合法 SVG 被拒: ${name}`);
+    }
+    // 攻击载荷:含 <svg 字样但不是 SVG 的任意文件,整个内容会被 base64 进 CSS
+    const bad = [
+        ['笔记含 <svg 字样', '# my notes\n<svg\nAPI_KEY=sk-secret123\n'],
+        ['日志含 <svg', 'INFO parsing <svg> ok\nPASSWORD=hunter2\n'],
+        ['HTML 内联 svg', '<html><body><svg></svg></body></html>'],
+        ['源码含 svg 字符串', 'const s = "<svg>";\nconst key = "sk-live-xxx";\n'],
+        ['私钥', '-----BEGIN OPENSSH PRIVATE KEY-----\nSECRET\n'],
+        ['hosts 文件', '127.0.0.1 localhost\n'],
+        ['JSON 配置', '{"token":"secret","note":"<svg"}']
+    ];
+    for (const [name, content] of bad) {
+        assert.strictEqual(ext.svgMagicOk(Buffer.from(content, 'utf8')), false, `非 SVG 被放行: ${name}`);
+    }
+});
+
+test('imageToDataUri 不内嵌含 <svg 字样的非 SVG 文件', () => {
+    const fs3 = require('node:fs');
+    const tmp = fs3.mkdtempSync(path.join(os.tmpdir(), 'beautify-svgfake-'));
+    try {
+        const p = path.join(tmp, 'secret.svg');
+        fs3.writeFileSync(p, '# notes\n<svg\nAPI_KEY=sk-secret123\nPASSWORD=hunter2\n');
+        assert.strictEqual(ext.imageToDataUri(ext.toFileUrl(p)), '',
+            '含 <svg 字样的文本文件不该被内嵌 —— 否则密钥明文进渲染 DOM');
+        // 真 SVG 仍然可用
+        const real = path.join(tmp, 'real.svg');
+        fs3.writeFileSync(real, '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>');
+        assert.match(ext.imageToDataUri(ext.toFileUrl(real)), /^data:image\/svg\+xml;base64,/,
+            '合法 SVG 应正常内嵌');
+    } finally {
+        fs3.rmSync(tmp, { recursive: true, force: true });
     }
 });
