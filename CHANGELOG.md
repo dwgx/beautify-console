@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.2.0] - Unreleased
+## [1.2.0] - 2026-08-09
 
 ### 安全
 - **导入配置可触发 OOM/挂死**：图片路径可指向 `/dev/zero` 等设备节点，`readFileSync` 无限读取拖垮扩展宿主。现在所有读文件路径先 `statSync` 校验 `isFile()`，设备/FIFO/目录/超大文件一律拒绝
